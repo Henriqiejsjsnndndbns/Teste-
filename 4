@@ -1,0 +1,305 @@
+#include <SPI.h>
+#include <RF24.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+
+// Pinos do nRF24 (ESP32-S3 DevKitC-1)
+// GPIO 4 e 5 são seguros e não conflitam com PSRAM em placas sem PSRAM
+#define CE_PIN 4
+#define CSN_PIN 5
+
+// Configurações
+const uint8_t BLE_PRIMARY_CHANNELS[] = {37, 38, 39, 12, 15, 16, 19, 20, 23, 24, 27, 28, 31, 32, 35, 36};
+const uint8_t PRIMARY_CHANNEL_COUNT = sizeof(BLE_PRIMARY_CHANNELS) / sizeof(BLE_PRIMARY_CHANNELS[0]);
+#define MAX_RUNTIME_MS 3600000 // 1 hora
+#define WEB_PORT 8080
+
+// Credenciais WiFi AP
+const char* apSSID = "MOG-Jammer-v2";
+const char* apPassword = "12345678";
+
+// Objetos globais
+RF24 radio(CE_PIN, CSN_PIN);
+AsyncWebServer server(WEB_PORT);
+
+// Estado do sistema
+bool jammingActive = true;
+bool bleScanMode = false;
+uint32_t startTime = 0;
+uint32_t totalPackets = 0;
+uint8_t currentChannel = 37;
+uint8_t targetChannel = 37;
+
+// Funções auxiliares
+void checkSafety();
+String getWiFiStatusHTML();
+void setTargetChannel(uint8_t ch);
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+  
+  setCpuFrequencyMhz(160);
+  btStop(); // Desliga Bluetooth nativo para evitar interferência no rádio
+
+  if (!radio.begin()) {
+    Serial.println("ERRO CRITICO: nRF24 não detectado. Verifique fiação.");
+    while (1);
+  }
+
+  // Configuração agressiva do rádio
+  radio.setPALevel(RF24_PA_MAX);
+  radio.setDataRate(RF24_2MBPS);
+  radio.setAutoAck(false);
+  radio.setAddressWidth(3);
+  radio.setRetries(0, 0);
+  radio.setCRCLength(RF24_CRC_DISABLED);
+  radio.setPayloadSize(32);
+  radio.disableDynamicPayloads();
+  radio.maskIRQ(true, true, true);
+  radio.powerUp();
+
+  // Inicia AP
+  WiFi.softAP(apSSID, apPassword);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+
+  startTime = millis();
+  setupWebServer();
+
+  Serial.println("Sistema Iniciado. Jamming: ON");
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+String getWiFiStatusHTML() {
+  String html = "<div class='stat-box'>";
+  if (WiFi.status() == WL_CONNECTED) {
+    html += "<h3>📶 WiFi Conectado</h3>";
+    html += "<p>Rede: " + String(WiFi.SSID()) + "</p>";
+    html += "<p>IP: " + WiFi.localIP().toString() + "</p>";
+    html += "<p>Força: " + String(WiFi.RSSI()) + " dBm</p>";
+  } else {
+    html += "<h3>📡 Modo Access Point</h3>";
+    html += "<p>Rede: " + String(apSSID) + "</p>";
+    html += "<p>IP: " + WiFi.softAPIP().toString() + "</p>";
+    html += "<p>MAC: " + WiFi.softAPmacAddress() + "</p>";
+  }
+  html += "</div>";
+  return html;
+}
+
+void setTargetChannel(uint8_t ch) {
+  // Verifica se é um canal BLE válido
+  for (uint8_t i = 0; i < PRIMARY_CHANNEL_COUNT; i++) {
+    if (BLE_PRIMARY_CHANNELS[i] == ch) {
+      targetChannel = ch;
+      currentChannel = ch;
+      radio.setChannel(ch);
+      return;
+    }
+  }
+  Serial.println("Canal inválido");
+}
+
+void setupWebServer() {
+  // Página Principal
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    String html = "<!DOCTYPE html><html lang='pt-BR'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<title>MOG Jammer v2.1</title>";
+    html += "<style>";
+    html += "body{font-family:'Courier New', monospace;background:#0a0a0a;color:#00ff00;padding:10px;text-align:center;}";
+    html += ".container{max-width:600px;margin:0 auto;border:1px solid #333;padding:15px;border-radius:8px;}";
+    html += ".stat-box{background:#1a1a1a;border:1px solid #00ff00;margin:10px 0;padding:10px;border-radius:4px;text-align:left;}";
+    html += "button{padding:10px 15px;margin:5px;border:none;cursor:pointer;font-weight:bold;color:#fff;border-radius:4px;}";
+    html += ".btn-green{background:#28a745;} .btn-red{background:#dc3545;} .btn-blue{background:#007bff;} .btn-gray{background:#6c757d;}";
+    html += ".grid{display:grid;grid-template-columns:repeat(4, 1fr);gap:5px;margin-top:10px;}";
+    html += ".status-active{color:#28a745;font-weight:bold;} .status-inactive{color:#dc3545;font-weight:bold;}";
+    html += "</style></head><body>";
+    
+    html += "<div class='container'>";
+    html += "<h2>📡 MOG JAMMER CONTROL</h2>";
+    
+    // Status WiFi
+    html += getWiFiStatusHTML();
+
+    // Status do Jammer
+    html += "<div class='stat-box'>";
+    html += "<p>Status: <span id='jamStatus' class='status-active'>CARREGANDO...</span></p>";
+    html += "<p>Canal: <span id='curCh'>--</span></p>";
+    html += "<p>Pacotes: <span id='pktCount'>0</span></p>";
+    html += "<p>Uptime: <span id='uptime'>0</span>s</p>";
+    html += "</div>";
+
+    // Controles Principais
+    html += "<div>";
+    html += "<button class='btn-green' onclick='toggleJam()'>LIGAR/DESLIGAR</button>";
+    html += "<button class='btn-blue' onclick='toggleScan()'>MODO SCAN</button>";
+    html += "</div>";
+
+    // Grade de Canais
+    html += "<div class='grid' id='chGrid'>";
+    // Botões gerados via JS
+    html += "</div>";
+
+    // Controles de Sistema
+    html += "<div style='margin-top:15px;'>";
+    html += "<button class='btn-gray' onclick='softReset()'>REINICIAR</button>";
+    html += "<button class='btn-red' onclick='hardStop()'>PARAR TUDO</button>";
+    html += "</div>";
+
+    html += "<script>";
+    html += "function updateStatus() {";
+    html += "  fetch('/status.json').then(r=>r.json()).then(d=>{";
+    html += "    document.getElementById('jamStatus').innerText = d.active ? 'ATIVO 🔴' : 'PARADO 🟢';";
+    html += "    document.getElementById('jamStatus').className = d.active ? 'status-active' : 'status-inactive';";
+    html += "    document.getElementById('curCh').innerText = d.channel;";
+    html += "    document.getElementById('pktCount').innerText = d.packets;";
+    html += "    document.getElementById('uptime').innerText = d.uptime;";
+    html += "  });";
+    html += "}";
+
+    html += "function toggleJam() { fetch('/toggle'); setTimeout(updateStatus, 200); }";
+    html += "function toggleScan() { fetch('/scanMode'); alert('Modo Scan alternado'); }";
+    html += "function setCh(ch) { fetch('/setCh?ch='+ch); }";
+    html += "function softReset() { if(confirm('Reiniciar?')) fetch('/reset').then(()=>setTimeout(()=>location.reload(), 2000)); }";
+    html += "function hardStop() { if(confirm('Parar tudo e desligar rádio?')) fetch('/stop'); }";
+
+    html += "function loadChannels() {";
+    html += "  fetch('/channels.json').then(r=>r.json()).then(d=>{";
+    html += "    let grid = document.getElementById('chGrid'); grid.innerHTML='';";
+    html += "    d.forEach(ch => {";
+    html += "      let btn = document.createElement('button');";
+    html += "      btn.className = 'btn-blue';";
+    html += "      btn.innerText = ch;";
+    html += "      btn.onclick = () => setCh(ch);";
+    html += "      grid.appendChild(btn);";
+    html += "    });";
+    html += "  });";
+    html += "}";
+
+    html += "setInterval(updateStatus, 1000);";
+    html += "loadChannels();";
+    html += "updateStatus();";
+    html += "</script></div></body></html>";
+
+    request->send(200, "text/html", html);
+  });
+
+  // API: Status
+  server.on("/status.json", HTTP_GET, [](AsyncWebServerRequest *request){
+    // Usando DynamicJsonDocument para ArduinoJson 6
+    DynamicJsonDocument doc(200);
+    doc["active"] = jammingActive;
+    doc["channel"] = currentChannel;
+    doc["packets"] = totalPackets;
+    doc["uptime"] = (millis() - startTime) / 1000;
+    
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
+  // API: Canais
+  server.on("/channels.json", HTTP_GET, [](AsyncWebServerRequest *request){
+    DynamicJsonDocument doc(200);
+    JsonArray arr = doc.to<JsonArray>();
+    for (uint8_t ch : BLE_PRIMARY_CHANNELS) {
+      arr.add(ch);
+    }
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
+  // API: Toggle
+  server.on("/toggle", HTTP_GET, [](AsyncWebServerRequest *request){
+    jammingActive = !jammingActive;
+    if (jammingActive) radio.powerUp();
+    else radio.powerDown();
+    request->send(200, "text/plain", "OK");
+  });
+
+  // API: Scan Mode
+  server.on("/scanMode", HTTP_GET, [](AsyncWebServerRequest *request){
+    bleScanMode = !bleScanMode;
+    request->send(200, "text/plain", "OK");
+  });
+
+  // API: Set Channel
+  server.on("/setCh", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (request->hasParam("ch")) {
+      int ch = request->getParam("ch")->value().toInt();
+      setTargetChannel(ch);
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  // API: Reset
+  server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/plain", "Rebooting...");
+    delay(500);
+    ESP.restart();
+  });
+
+  // API: Stop
+  server.on("/stop", HTTP_GET, [](AsyncWebServerRequest *request){
+    jammingActive = false;
+    radio.powerDown();
+    request->send(200, "text/plain", "Stopped");
+  });
+
+  server.begin();
+}
+
+void jamBLE() {
+  static uint8_t channelIndex = 0;
+  static uint32_t lastChange = 0;
+  uint32_t now = millis();
+
+  if (!jammingActive) return;
+
+  // Lógica de troca de canal
+  if (bleScanMode) {
+    // Modo aleatório rápido
+    if (now - lastChange > 20) {
+      channelIndex = random(0, PRIMARY_CHANNEL_COUNT);
+      currentChannel = BLE_PRIMARY_CHANNELS[channelIndex];
+      radio.setChannel(currentChannel);
+      lastChange = now;
+    }
+  } else {
+    // Modo sequencial rápido
+    if (now - lastChange > 5) {
+      channelIndex = (channelIndex + 1) % PRIMARY_CHANNEL_COUNT;
+      currentChannel = BLE_PRIMARY_CHANNELS[channelIndex];
+      radio.setChannel(currentChannel);
+      lastChange = now;
+    }
+  }
+
+  // Envio do pacote de ruído
+  uint8_t noise[32];
+  memset(noise, 0xFF, 32); // Preenche com 1s para máximo ruído
+  radio.writeFast(noise, 32);
+  radio.flush_tx();
+  
+  // Segundo pacote para saturar
+  radio.writeFast(noise, 32);
+  
+  totalPackets += 2;
+}
+
+void checkSafety() {
+  if ((millis() - startTime) > MAX_RUNTIME_MS) {
+    Serial.println("Tempo esgotado. Desligando.");
+    radio.powerDown();
+    WiFi.softAPdisconnect(true);
+    esp_deep_sleep_start();
+  }
+}
+
+void loop() {
+  jamBLE();
+  checkSafety();
+}
