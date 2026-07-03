@@ -1,0 +1,305 @@
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+
+// Pinos do nRF24
+#define CE_PIN 4
+#define CSN_PIN 5
+
+// Configurações
+const uint8_t BLE_PRIMARY_CHANNELS[] = {37, 38, 39, 12, 15, 16, 19, 20, 23, 24, 27, 28, 31, 32, 35, 36};
+const uint8_t PRIMARY_CHANNEL_COUNT = sizeof(BLE_PRIMARY_CHANNELS) / sizeof(BLE_PRIMARY_CHANNELS[0]);
+#define MAX_RUNTIME_MS 3600000
+#define FULL_SCAN_INTERVAL 120000
+#define WEB_PORT 8080
+
+// Credenciais WiFi (Modo AP)
+const char* apSSID = "MOG-Jammer-Control";
+const char* apPassword = "12345678";
+
+// Definição única do objeto radio
+RF24 radio(CE_PIN, CSN_PIN);
+AsyncWebServer server(WEB_PORT);
+
+// Estado do sistema
+bool jammingActive = true;
+uint32_t startTime = 0;
+uint32_t totalPackets = 0;
+uint8_t currentChannel = 37;
+bool bleScanMode = false;
+uint8_t targetChannel = 37;
+
+void jamBLE();
+void checkSafety();
+void setupWebServer();
+String getWiFiStatus();
+void setTargetChannel(uint8_t ch);
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+  delay(100);
+
+  setCpuFrequencyMhz(160);
+  btStop();
+
+  if (!radio.begin()) {
+    Serial.println("ERRO: Radio nRF24 não respondeu");
+    while (1);
+  }
+
+  radio.setPALevel(RF24_PA_MAX);
+  radio.setDataRate(RF24_2MBPS);
+  radio.setAutoAck(false);
+  radio.setAddressWidth(3);
+  radio.setRetries(0, 0);
+  radio.setCRCLength(RF24_CRC_DISABLED);
+  radio.setPayloadSize(32);
+  radio.disableDynamicPayloads();
+  radio.maskIRQ(true, true, true);
+  radio.powerUp();
+
+  WiFi.softAP(apSSID, apPassword);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+
+  startTime = millis();
+
+  setupWebServer();
+
+  Serial.println("Sistema Pronto. Jamming: ON");
+  Serial.print("IP do AP: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+String getWiFiStatus() {
+  String status = "<p>WiFi status: ";
+
+  if (WiFi.status() == WL_CONNECTED) {
+    status += "CONECTADO</p>";
+    status += "<p>Rede: " + String(WiFi.SSID()) + "</p>";
+    status += "<p>IP Local: " + WiFi.localIP().toString() + "</p>";
+    status += "<p>MAC: " + WiFi.macAddress() + "</p>";
+    status += "<p>BSSID: " + WiFi.BSSIDstr() + "</p>";
+    status += "<p>Força: " + String(WiFi.RSSI()) + " dBm</p>";
+  } else {
+    status += "Modo AP</p>";
+    status += "<p>Rede: " + String(apSSID) + "</p>";
+    status += "<p>IP: " + WiFi.softAPIP().toString() + "</p>";
+    status += "<p>Mac AP: " + WiFi.softAPmacAddress() + "</p>";
+  }
+
+  return status;
+}
+
+void setTargetChannel(uint8_t ch) {
+  if (ch < 37 || ch > 39) {
+    for (int i = 0; i < PRIMARY_CHANNEL_COUNT; i++) {
+      if (BLE_PRIMARY_CHANNELS[i] == ch) {
+        targetChannel = ch;
+        radio.setChannel(ch);
+        Serial.print("Canal ajustado manualmente: ");
+        Serial.println(ch);
+        return;
+      }
+    }
+  }
+  Serial.println("Canal inválido para BLE");
+}
+
+void setupWebServer() {
+  // Página Principal
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<title>MOG Jammer Control</title>";
+    html += "<style>body{font-family:sans-serif;background:#111;color:#0ff;text-align:center;padding:20px;}";
+    html += ".container{max-width:800px;margin:0 auto;}";
+    html += ".btn{padding:12px 24px;font-size:16px;border:none;border-radius:5px;cursor:pointer;margin:8px;}";
+    html += ".on{background:#00ff00;color:#000;} .off{background:#ff0000;color:#fff;}";
+    html += ".primary{background:#007bff;color:#fff;}";
+    html += ".secondary{background:#6c757d;color:#fff;}";
+    html += ".danger{background:#dc3545;color:#fff;}";
+    html += ".grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:15px 0;}";
+    html += ".stat{background:#222;padding:12px;border-radius:8px;margin:8px;text-align:left;}";
+    html += ".hidden{display:none;}";
+    html += "</style></head><body>";
+    html += "<div class='container'><h1>📡 MOG Jammer Control v2.1</h1>";
+
+    html += "<div class='stat'>" + getWiFiStatus() + "</div>";
+
+    html += "<div class='stat'>";
+    html += "<p><strong>Status Jamming:</strong> <span id='status'>...</span></p>";
+    html += "<p><strong>Canal Ativo:</strong> <span id='ch'>...</span></p>";
+    html += "<p><strong>Pacotes Enviados:</strong> <span id='pkts'>...</span></p>";
+    html += "<p><strong>Tempo Ativo:</strong> <span id='uptime'>...</span>s</p>";
+    html += "</div>";
+
+    html += "<div class='grid'>";
+    html += "<button class='btn primary' onclick='toggleJam()'>ATIVAR/DESATIVAR</button>";
+    html += "<button class='btn secondary' onclick='scanChannels()'>ESCANEAR CANAIS</button>";
+    html += "<button class='btn secondary' onclick='setChannel(37)'>CANAL 37</button>";
+    html += "<button class='btn secondary' onclick='setChannel(38)'>CANAL 38</button>";
+    html += "</div>";
+
+    html += "<div class='grid' id='channelGrid'></div>";
+
+    html += "<div class='grid'>";
+    html += "<button class='btn danger' onclick='softReset()'>RESET SOFT</button>";
+    html += "<button class='btn danger' onclick='hardShutdown()'>SHUTDOWN</button>";
+    html += "<button class='btn secondary' onclick='setBleMode()'>MODO BLE ESCANEIA</button>";
+    html += "</div>";
+
+    html += "<script>";
+    html += "function updateStatus() { fetch('/status').then(r=>r.json()).then(d=>{";
+    html += "document.getElementById('status').innerText = d.active ? '🔴 ATIVO' : '🟢 PARADO';";
+    html += "document.getElementById('ch').innerText = d.channel;";
+    html += "document.getElementById('pkts').innerText = d.packets;";
+    html += "document.getElementById('uptime').innerText = d.uptime;";
+    html += "}); }";
+
+    html += "function toggleJam() { fetch('/toggle').then(updateStatus); }";
+    html += "function setChannel(ch) { fetch('/setCh?ch='+ch).then(updateStatus); }";
+    html += "function softReset() { if(confirm('Resetar sistema?')) fetch('/softReset').then(()=>location.reload()); }";
+    html += "function hardShutdown() { if(confirm('Shutdown total?')) fetch('/shutdown').then(()=>alert('Sistema desligado'))); }";
+    html += "function setBleMode() { fetch('/bleMode'); alert('Modo BLE Escaneia ativado'); updateStatus(); }";
+
+    html += "function loadChannels() { fetch('/channels').then(r=>r.json()).then(d=>{";
+    html += "let grid = document.getElementById('channelGrid'); grid.innerHTML='';";
+    html += "d.forEach(ch => {";
+    html += "let btn = document.createElement('button');";
+    html += "btn.className = 'btn secondary';";
+    html += "btn.innerText = 'Ch ' + ch;";
+    html += "btn.onclick = () => setChannel(ch);";
+    html += "grid.appendChild(btn);";
+    html += "});";
+    html += "}); }";
+
+    html += "setInterval(updateStatus, 1000);";
+    html += "updateStatus();";
+    html += "loadChannels();";
+    html += "setInterval(loadChannels, 15000);";
+    html += "</script></div></body></html>";
+
+    request->send(200, "text/html", html);
+  });
+
+  // Endpoint JSON de Status
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request){
+    JsonDocument doc;
+    doc["active"] = jammingActive;
+    doc["channel"] = currentChannel;
+    doc["packets"] = totalPackets;
+    doc["uptime"] = (millis() - startTime) / 1000;
+    doc["wifiStatus"] = WiFi.status() == WL_CONNECTED ? 1 : 0;
+    doc["ssid"] = WiFi.status() == WL_CONNECTED ? String(WiFi.SSID()) : String(apSSID);
+
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
+  // Endpoint para Alternar
+  server.on("/toggle", HTTP_GET, [](AsyncWebServerRequest *request){
+    jammingActive = !jammingActive;
+    if(jammingActive) {
+      radio.powerUp();
+    } else {
+      radio.powerDown();
+    }
+    request->send(200, "application/json", "{\"result\":\"ok\"}");
+  });
+
+  // Endpoint para setar canal
+  server.on("/setCh", HTTP_GET, [](AsyncWebServerRequest *request){
+    if(request->hasParam("ch")) {
+      int ch = request->getParam("ch")->value().toInt();
+      setTargetChannel(ch);
+    }
+    request->send(200, "application/json", "{\"result\":\"ok\"}");
+  });
+
+  // Endpoint lista canais
+  server.on("/channels", HTTP_GET, [](AsyncWebServerRequest *request){
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (uint8_t ch : BLE_PRIMARY_CHANNELS) {
+      arr.add(ch);
+    }
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
+  // Endpoint modo BLE
+  server.on("/bleMode", HTTP_GET, [](AsyncWebServerRequest *request){
+    bleScanMode = !bleScanMode;
+    radio.setChannel(BLE_PRIMARY_CHANNELS[random(0, PRIMARY_CHANNEL_COUNT)]);
+    request->send(200, "application/json", "{\"result\":\"ok\"}");
+  });
+
+  // Endpoint reset
+  server.on("/softReset", HTTP_GET, [](AsyncWebServerRequest *request){
+    ESP.restart();
+    request->send(200, "application/json", "{\"result\":\"rebooting\"}");
+  });
+
+  // Endpoint shutdown
+  server.on("/shutdown", HTTP_GET, [](AsyncWebServerRequest *request){
+    radio.powerDown();
+    WiFi.softAPdisconnect(true);
+    esp_deep_sleep_start();
+    request->send(200, "application/json", "{\"result\":\"shutdown\"}");
+  });
+
+  server.begin();
+}
+
+void jamBLE() {
+  static uint8_t channelIndex = 0;
+  static uint32_t lastChannelChange = 0;
+  uint32_t currentTime = millis();
+
+  if (!jammingActive) return;
+
+  if (bleScanMode) {
+    if (currentTime - lastChannelChange > 20) {
+      channelIndex = random(0, PRIMARY_CHANNEL_COUNT);
+      setTargetChannel(BLE_PRIMARY_CHANNELS[channelIndex]);
+      lastChannelChange = currentTime;
+    }
+  } else {
+    if (currentTime - lastChannelChange > 5) {
+      channelIndex = (channelIndex + 1) % PRIMARY_CHANNEL_COUNT;
+      setTargetChannel(BLE_PRIMARY_CHANNELS[channelIndex]);
+      lastChannelChange = currentTime;
+    }
+  }
+
+  uint8_t noise[32];
+  memset(noise, 0xAA, sizeof(noise));  // Preenche com padrão estável
+  radio.writeFast(noise, sizeof(noise));
+  radio.flush_tx();
+  radio.writeFast(noise, sizeof(noise));
+  totalPackets += 2;
+
+  // Flush RX para evitar overflow
+  while(radio.testCarrier()) {
+    radio.readCarrierFrequency();
+  }
+}
+
+void checkSafety() {
+  if ((millis() - startTime) > MAX_RUNTIME_MS) {
+    Serial.println("⚠️ SEGURANÇA: Shutdown automático");
+    radio.powerDown();
+    WiFi.softAPdisconnect(true);
+    esp_deep_sleep_start();
+  }
+}
+
+void loop() {
+  jamBLE();
+  checkSafety();
+}
