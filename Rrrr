@@ -1,0 +1,17 @@
+[env:esp32s3]
+platform = espressif32
+board = esp32-s3-devkitc-1
+framework = arduino
+monitor_speed = 115200
+upload_speed = 921600
+
+lib_deps =
+    nRF24L01 @ 1.0.13
+    ESPAsyncWebServer-esphome @ 3.4.0
+    AsyncTCP-esphome @ 2.0.0
+    ArduinoJson @ 6.21.0
+
+build_flags =
+    -DBOARD_HAS_PSRAM
+    -mfix-esp32-psi
+    -DARDUINO_USB_CDC_ON_BOOT=1
