@@ -1,0 +1,15 @@
+[env]
+platform = espressif32
+board = esp32dev
+framework = arduino
+monitor_speed = 115200
+
+lib_deps =
+    nRF24L01 @ 1.0.13
+    ESPAsyncWebServer-esphome @ 3.4.0  # Versão compatível
+    AsyncTCP-esphome @ 2.0.0            # Versão compatível
+    ArduinoJson @ 6.21.0                # Versão estável
+
+build_flags =
+    -DBOARD_HAS_PSRAM
+    -mfix-esp32-psi
