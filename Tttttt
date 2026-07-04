@@ -1,0 +1,27 @@
+#include <SPI.h>
+#include <RF24.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+
+// Pinos do nRF24 (ESP32-S3 DevKitC-1)
+#define CE_PIN   4
+#define CSN_PIN  5
+#define SCK_PIN  12
+#define MISO_PIN 13
+#define MOSI_PIN 11
+
+// Configurações
+const uint8_t BLE_PRIMARY_CHANNELS[] = {37, 38, 39, 12, 15, 16, 19, 20, 23, 24, 27, 28, 31, 32, 35, 36};
+const uint8_t PRIMARY_CHANNEL_COUNT = sizeof(BLE_PRIMARY_CHANNELS) / sizeof(BLE_PRIMARY_CHANNELS[0]);
+
+#define MAX_RUNTIME_MS 3600000 // 1 hora
+#define WEB_PORT 8080
+
+// Credenciais Wi-Fi (Modo Station)
+const char* ssid = "INFORNET_MARIANA";
+const char* password = "anamaria";
+
+// Objetos globais
+RF24 radio(CE_PIN, CSN_PIN);
+AsyncWebServer server(WEB_PORT);
