@@ -60,7 +60,7 @@ void setup() {
 
 void TaskRedeServidor(void *pvParameters) {
     esp_task_wdt_add(NULL);
-    char packetBuffer[256]; 
+    char packetBuffer[128]; // Modificado para array fixo de tamanho seguro
     
     for(;;) {
         esp_task_wdt_reset();
@@ -80,7 +80,7 @@ void TaskRedeServidor(void *pvParameters) {
 
 void TaskProcessamentoNeural(void *pvParameters) {
     esp_task_wdt_add(NULL);
-    char bufferLeitura[256];
+    char bufferLeitura[128]; // Modificado para array fixo de tamanho seguro
     TelemetriaIA dadosEnvio;
 
     for(;;) {
