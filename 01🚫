@@ -1,133 +1,137 @@
-#include <Arduino.h>
-#include <WiFi.h>
-#include <WiFiUdp.h>
-#include <Preferences.h>
-#include <esp_task_wdt.h>
-#include "ia_engine.h"
-#include "web_server.h"
+import os
+os.environ["OPENCV_DISABLE_CPU_FEATURES"] = "AVX2,AVX,FMA,SSE4_1,SSE4_2"
 
-// Definição de Limites de Hardware do Watchdog
-#define WATCHDOG_TIMOUT_SECS 10
+import socket
+import time
+import json
+import cv2
+import numpy as np
+import mss
+import pytesseract
+import pyttsx3
 
-// Canais de Comunicação Assíncronos Inter-Task (FreeRTOS Queues)
-QueueHandle_t xFilaUdpDados = NULL;
+# Configurações do ecossistema e rede
+ESP32_IP = "192.168.4.1"
+UDP_PORT = 12345
 
-// Semáforo Mutex de Proteção dos Recursos de Persistência NVS
-SemaphoreHandle_t xMutexNVS = NULL;
+# Inicialização do sintetizador de voz offline
+engine = pyttsx3.init()
+engine.setProperty('rate', 165)
 
-WiFiUDP udpServidor;
-unsigned int portaUdp = 12345;
+# Cérebro Preditivo (Cadeia de Markov Incremental)
+historico_eventos = []
+transicoes = {} # Dicionário de frequências de transição de estados
+estado_atual = "IDLE"
+previsao_anterior = "IDLE"
 
-MotorIA processadorIA;
-ServidorAssincrono webInterface;
-Preferences nvMemory;
+# Métricas de Validação Científica
+total_previsoes = 0
+previsoes_corretas = 0
+soma_erros_quad = 0.0
 
-// Protótipos das Tasks do Core RTOS
-void TaskComunicacaoRede(void *pvParameters);
-void TaskAlgoritmoNeural(void *pvParameters);
+def falar(texto):
+    """Executa a síntese de voz em segundo plano de forma descritiva."""
+    print(f"[Voz]: {texto}")
+    engine.say(texto)
+    engine.runAndWait()
 
-void setup() {
-    Serial.begin(115200);
+def prever_proximo_estado(estado):
+    """Calcula estatisticas de probabilidade do próximo evento."""
+    if estado not in transicoes or not transicoes[estado]:
+        return "IDLE", 50.0
     
-    // 1. Instanciação dos Mecanismos de Sincronização de Threads
-    xFilaUdpDados = xQueueCreate(20, sizeof(float)); 
-    xMutexNVS = xSemaphoreCreateMutex();
+    proximos = transicoes[estado]
+    total = sum(proximos.values())
+    melhor_proximo = max(proximos, key=proximos.get)
+    confianca = (proximos[melhor_proximo] / total) * 100.0
+    return melhor_proximo, confianca
 
-    // 2. Configuração Básica do Watchdog de Hardware do Sistema
-    esp_task_wdt_init(WATCHDOG_TIMOUT_SECS, true);
-    esp_task_wdt_add(NULL); 
+def treinar_modelo(estado_velho, estado_novo):
+    """Atualiza pesos da matriz de transição dinamicamente."""
+    if estado_velho not in transicoes:
+        transicoes[estado_velho] = {}
+    if estado_novo not in transicoes[estado_velho]:
+        transicoes[estado_velho][estado_novo] = 0
+    transicoes[estado_velho][estado_novo] += 1
 
-    // 3. Restauração Não Volátil Segura de Pesos Neurais (Preferences API)
-    if (xMutexNVS != NULL && xSemaphoreTake(xMutexNVS, portMAX_DELAY) == pdTRUE) {
-        nvMemory.begin("ia_nvs", true); 
-        float p = nvMemory.getFloat("p_syn", 0.5f);
-        float b = nvMemory.getFloat("b_syn", 0.0f);
-        uint32_t c = nvMemory.getUInt("c_total", 0);
-        uint32_t a = nvMemory.getUInt("a_total", 0);
-        processadorIA.configurarPesos(p, b, c, a);
-        nvMemory.end();
-        xSemaphoreGive(xMutexNVS);
-        Serial.println("[NVS Kernel] Estados neurais regenerados com sucesso.");
-    }
-
-    processadorIA.inicializar();
-
-    // 4. Inicialização Robusta e Estabilização do Rádio Wi-Fi
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP("ESP32_IA_Network", "ia_password_123", 1, 0, 4); 
+def processar_visao_computacional(img):
+    """Analisa o frame buscando padrões, textos (OCR) e contornos visuais."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    webInterface.inicializar();
-    udpServidor.begin(portaUdp);
-
-    // 5. Instanciação e Fixação Estrita de Tasks nos Dois Núcleos Físicos (Dual Core Ativo)
-    xTaskCreatePinnedToCore(TaskComunicacaoRede, "TaskNet", 4096, NULL, 1, NULL, 1);
-    xTaskCreatePinnedToCore(TaskAlgoritmoNeural, "TaskNeural", 4096, NULL, 2, NULL, 0);
-
-    Serial.println("[Core RTOS] Kernel Multitarefa operando perfeitamente.");
-}
-
-void TaskComunicacaoRede(void *pvParameters) {
-    esp_task_wdt_add(NULL); 
+    # OCR Rápido limitado a strings curtas para economizar ciclos de CPU
+    texto = pytesseract.image_to_string(gray, config='--psm 7').strip()
     
-    char packetBuffer[256]; // Buffer estático e seguro contra estouro de pilha
+    # Detecção de elementos estruturais (Botões, Menus, Ícones)
+    _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+    contornos, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    for(;;) {
-        esp_task_wdt_reset(); 
-        webInterface.atualizar();
+    botoes_detectados = 0
+    for c in contornos:
+        if cv2.contourArea(c) > 150: # Filtro de tamanho para contornos válidos
+            botoes_detectados += 1
 
-        int packetSize = udpServidor.parsePacket();
-        if (packetSize && packetSize < (int)sizeof(packetBuffer)) {
-            int len = udpServidor.read(packetBuffer, sizeof(packetBuffer) - 1);
-            if (len > 0) {
-                packetBuffer[len] = 0;
-                char* token = strchr(packetBuffer, '|');
-                float valor_bruto = (token != nullptr) ? strtof(packetBuffer, nullptr) : strtof(packetBuffer, nullptr);
+    # Classificação heurística de estado baseada no contexto visual
+    if "menu" in texto.lower() or "settings" in texto.lower():
+        return f"MENU_ABERTO_{botoes_detectados}"
+    elif botoes_detectados > 12:
+        return f"LISTA_COMPLEXA_{botoes_detectados}"
+    elif botoes_detectados > 2:
+        return f"INTERFACE_ATIVA_{botoes_detectados}"
+    return "TELA_ESTATICA"
+
+falar("Sistema preditivo de visão computacional ativo.")
+
+# Captura de alta eficiência via hardware utilizando a biblioteca MSS
+with mss.mss() as sct:
+    # Captura a tela principal inteira onde o scrcpy deve estar em foco
+    monitor = sct.monitors[1]
+    
+    while True:
+        try:
+            start_time = time.time()
+            sct_img = sct.grab(monitor)
+            frame = np.array(sct_img)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+            # Extração de Features por Visão Computacional
+            novo_estado = processar_visao_computacional(frame)
+
+            if novo_estado != estado_atual:
+                # Medição de Precisão da IA
+                global total_previsoes, previsoes_corretas, soma_erros_quad
+                if total_previsoes > 0:
+                    acertou = (previsao_anterior == novo_estado)
+                    if acertou:
+                        previsoes_corretas += 1
+                    erro_num = 0.0 if acertou else 1.0
+                    soma_erros_quad += erro_num ** 2
+
+                # Treinamento Online Incremental
+                treinar_modelo(estado_atual, novo_estado)
+                estado_atual = novo_estado
                 
-                xQueueSend(xFilaUdpDados, &valor_bruto, 0);
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(5)); 
-    }
-}
+                # Executa nova previsão futura
+                previsao_futura, nivel_confianca = prever_proximo_estado(estado_atual)
+                previsao_anterior = previsao_futura
+                total_previsoes += 1
 
-void TaskAlgoritmoNeural(void *pvParameters) {
-    esp_task_wdt_add(NULL);
-    float valor_recebido = 0.0f;
-    TelemetriaIA dados_locais;
+                precisao_acc = (previsoes_corretas / total_previsoes) * 100.0
+                rmse = (soma_erros_quad / total_previsoes) ** 0.5
 
-    for(;;) {
-        esp_task_wdt_reset();
-        
-        if (xQueueReceive(xFilaUdpDados, &valor_recebido, pdMS_TO_TICKS(500)) == pdTRUE) {
-            float pr = 0.0f, er = 0.0f;
-            
-            bool sucesso = processadorIA.processarAmostra(valor_recebido, pr, er);
-            
-            if (sucesso) {
-                processadorIA.obterTelemetria(dados_locais);
+                falar(f"Mudança detectada. Novo estado: {estado_atual}. Próxima ação prevista: {previsao_futura}.")
+
+                # Envio dos dados estruturados compactados via pacote UDP plano
+                payload = f"{estado_atual}|{previsao_futura}|{nivel_confianca:.1f}|{precisao_acc:.1f}|{rmse:.2f}"
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.sendto(payload.encode("utf-8"), (ESP32_IP, UDP_PORT))
                 
-                webInterface.transmitirTelemetria(dados_locais, esp_get_free_heap_size(), millis() / 1000);
+                print(f"[Notebook -> ESP32]: {payload}")
 
-                if (dados_locais.total_ciclos % 1000 == 0) {
-                    if (xMutexNVS != NULL && xSemaphoreTake(xMutexNVS, pdMS_TO_TICKS(10)) == pdTRUE) {
-                        nvMemory.begin("ia_nvs", false); 
-                        nvMemory.putFloat("p_syn", dados_locais.peso);
-                        nvMemory.putFloat("b_syn", dados_locais.bias);
-                        nvMemory.putUInt("c_total", dados_locais.total_ciclos);
-                        nvMemory.putUInt("a_total", dados_locais.total_anomalias);
-                        nvMemory.end();
-                        xSemaphoreGive(xMutexNVS);
-                    }
-                }
-            }
-        }
-    }
-}
+            # Latência adaptativa controlada por hardware
+            elapsed = time.time() - start_time
+            sleep_time = max(0.05, 0.4 - elapsed)
+            time.sleep(sleep_time)
 
-// CORRIGIDO: Função obrigatória do ecossistema Arduino incluída perfeitamente.
-// Como usamos o FreeRTOS com prioridades estritas, mantemos o loop em baixo consumo 
-// para não interferir nas tarefas de tempo real dos núcleos 0 e 1.
-void loop() {
-    vTaskDelay(pdMS_TO_TICKS(1000));
-}
+        except Exception as e:
+            print(f"[Erro Script]: {e}")
+            time.sleep(1)
