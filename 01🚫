@@ -1,0 +1,21 @@
+#pragma once
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include "ia_engine.h"
+
+class ServidorAssincrono {
+private:
+    WebServer server;
+    WebSocketsServer webSocket;
+    uint8_t clientes_conectados;
+
+public:
+    ServidorAssincrono();
+    void inicializar();
+    void atualizar();
+    void transmitirTelemetria(const TelemetriaIA& dados, uint32_t ram_livre, uint32_t uptime);
+    uint8_t getClientesConectados() const { return clientes_conectados; }
+    
+    // Handler interno de eventos WebSocket
+    void gerenciarEventoWS(uint8_t num, W_TYPE type, uint8_t * payload, size_t length);
+};
