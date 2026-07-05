@@ -1,0 +1,59 @@
+import os
+# Desativa extensões de CPU avançadas para evitar o erro "illegal hardware instruction"
+os.environ["OPENCV_DISABLE_CPU_FEATURES"] = "AVX2,AVX,FMA,SSE4_1,SSE4_2"
+
+import socket
+import time
+import cv2
+import numpy as np
+import pyautogui
+
+# O ESP32 criará a rede. Por padrão, o IP do ESP32 nessa rede própria é 192.168.4.1
+ESP32_IP = "192.168.10.33"
+PORT = 80  # Porta do servidor web do ESP32 para receber dados via POST/REST
+
+# Variáveis da IA
+valor_anterior = 0.0
+previsao_anterior = 0.0
+memoria_ia_peso = 0.5
+TAXA_APRENDIZADO = 0.1
+
+
+def inteligencia_artificial_prever(frame_atual):
+    global valor_anterior, previsao_anterior, memoria_ia_peso
+
+    valor_atual = float(np.mean(frame_atual))
+    erro = valor_atual - previsao_anterior
+    memoria_ia_peso += erro * TAXA_APRENDIZADO
+    proximo_passo_previsto = valor_atual * memoria_ia_peso
+
+    valor_anterior = valor_atual
+    previsao_anterior = proximo_passo_previsto
+
+    return valor_atual, proximo_passo_previsto, erro
+
+
+print(
+    "IA Inicializada. Conecte este notebook no Wi-Fi do ESP32 ('ESP32_IA_Network') primeiro!"
+)
+time.sleep(2)
+
+while True:
+    try:
+        # Captura tela do Scrcpy
+        print_tela = pyautogui.screenshot()
+        frame = cv2.cvtColor(np.array(print_tela), cv2.COLOR_RGB2BGR)
+
+        atual, previsao, erro = inteligencia_artificial_prever(frame)
+
+        # Envia os dados processados para a API interna do ESP32 via Socket UDP bruto para máxima velocidade
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            payload = f"{atual:.1f}|{previsao:.1f}|{erro:.1f}|{memoria_ia_peso:.3f}"
+            s.sendto(payload.encode("utf-8"), (ESP32_IP, 12345))
+
+        print(f"[Notebook -> ESP32] Enviado: {payload}")
+        time.sleep(0.3)
+
+    except Exception as e:
+        print(f"Aguardando rede ou erro: {e}")
+        time.sleep(1)
