@@ -1,27 +1,64 @@
-#pragma once
-#include <Arduino.h>
+#include "ia_engine.h"
+#include <cmath>
 
-struct TelemetriaIA {
-    char estado_atual[32];
-    char previsao[32];
-    float confianca;
-    float precisao;
-    float rmse;
-    uint32_t total_ciclos;
-    uint32_t total_anomalias;
-};
+MotorIA::MotorIA() : welford_m(0.0), welford_s(0.0), contagem_welford(0) {
+    memset(&dados, 0, sizeof(TelemetriaIA));
+    strcpy(dados.estado_atual, "Aguardando...");
+    strcpy(dados.previsao, "Calculando...");
+}
 
-class MotorIA {
-private:
-    TelemetriaIA dados;
-    double welford_m;
-    double welford_s;
-    uint32_t contagem_welford;
+void MotorIA::inicializar() {
+    contagem_welford = 0;
+}
 
-public:
-    MotorIA();
-    void inicializar();
-    bool atualizarMetricas(const String& pacote);
-    void obterTelemetria(TelemetriaIA& dest);
-    void configurarHistorico(uint32_t ciclos, uint32_t anomalias);
-};
+void MotorIA::configurarHistorico(uint32_t ciclos, uint32_t anomalias) {
+    dados.total_ciclos = ciclos;
+    dados.total_anomalias = anomalias;
+}
+
+bool MotorIA::atualizarMetricas(const String& pacote) {
+    int idx1 = pacote.indexOf('|');
+    int idx2 = pacote.indexOf('|', idx1 + 1);
+    int idx3 = pacote.indexOf('|', idx2 + 1);
+    int idx4 = pacote.indexOf('|', idx3 + 1);
+
+    if (idx1 == -1 || idx2 == -1 || idx3 == -1 || idx4 == -1) return false;
+
+    // Isola as strings de estados textuais enviados por OCR/Visão Computacional
+    String est = pacote.substring(0, idx1);
+    String prev = pacote.substring(idx1 + 1, idx2);
+    
+    // Tratamento estrito contra transbordo de arrays estáticos (Buffer Overflow Guard)
+    memset(dados.estado_atual, 0, sizeof(dados.estado_atual));
+    memset(dados.previsao, 0, sizeof(dados.previsao));
+    strncpy(dados.estado_atual, est.c_str(), sizeof(dados.estado_atual) - 1);
+    strncpy(dados.previsao, prev.c_str(), sizeof(dados.previsao) - 1);
+
+    dados.confianca = pacote.substring(idx2 + 1, idx3).toFloat();
+    dados.precisao = pacote.substring(idx3 + 1, idx4).toFloat();
+    dados.rmse = pacote.substring(idx4 + 1).toFloat();
+
+    // Detecção Dinâmica de Anomalias Preditivas (Se confiança despencar abruptamente)
+    contagem_welford++;
+    if (contagem_welford == 1) {
+        welford_m = dados.confianca;
+    } else {
+        double antigo_m = welford_m;
+        welford_m += (dados.confianca - antigo_m) / contagem_welford;
+        welford_s += (dados.confianca - antigo_m) * (dados.confianca - welford_m);
+    }
+
+    if (contagem_welford > 10) {
+        double desvio = sqrt(welford_s / (contagem_welford - 1));
+        if (desvio > 0.5 && (welford_m - dados.confianca) > (3.0 * desvio)) {
+            dados.total_anomalias++; // Anomalia de comportamento detectada
+        }
+    }
+
+    dados.total_ciclos++;
+    return true;
+}
+
+void MotorIA::obterTelemetria(TelemetriaIA& dest) {
+    memcpy(&dest, &dados, sizeof(TelemetriaIA));
+}
