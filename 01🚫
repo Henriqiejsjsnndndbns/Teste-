@@ -1,114 +1,21 @@
+#pragma once
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WiFiUdp.h>
-#include <Preferences.h>
-#include <esp_task_wdt.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
 #include "ia_engine.h"
-#include "web_server.h"
 
-#define WDT_TIMEOUT_VAL 10
+class ServidorAssincrono {
+private:
+    WebServer server;
+    WebSocketsServer webSocket;
+    uint8_t clientes;
 
-QueueHandle_t xFilaPacotes = NULL;
-SemaphoreHandle_t xMutexFlash = NULL;
+    static const char INDEX_HTML[] PROGMEM;
 
-WiFiUDP udpSocket;
-unsigned int portaUdp = 12345;
-
-MotorIA cerebroLocal;
-ServidorAssincrono portalWeb;
-Preferences flashMemory;
-
-void TaskRedeServidor(void *pvParameters);
-void TaskProcessamentoNeural(void *pvParameters);
-
-void setup() {
-    Serial.begin(115200);
-    
-    // Alocacao segura para copia de pacotes de strings de 128 bytes
-    xFilaPacotes = xQueueCreate(30, 128); 
-    xMutexFlash = xSemaphoreCreateMutex();
-
-    esp_task_wdt_init(WDT_TIMEOUT_VAL, true);
-    esp_task_wdt_add(NULL);
-
-    // Carrega o historico gravado nas particoes do Preferences
-    if (xMutexFlash != NULL && xSemaphoreTake(xMutexFlash, portMAX_DELAY) == pdTRUE) {
-        flashMemory.begin("dist_ia", true);
-        uint32_t c = flashMemory.getUInt("ciclos", 0);
-        uint32_t a = flashMemory.getUInt("anomalias", 0);
-        cerebroLocal.configurarHistorico(c, a);
-        flashMemory.end();
-        xSemaphoreGive(xMutexFlash);
-    }
-
-    cerebroLocal.inicializar();
-
-    // Inicializacao do radio Wi-Fi em modo Access Point
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP("ESP32_IA_Network", "ia_password_123", 1, 0, 4);
-
-    portalWeb.inicializar();
-    udpSocket.begin(portaUdp);
-
-    // Divisao estrita nos dois nucleos estaveis do ESP32-S3
-    xTaskCreatePinnedToCore(TaskRedeServidor, "TaskNet", 4096, NULL, 1, NULL, 1); 
-    xTaskCreatePinnedToCore(TaskProcessamentoNeural, "TaskNeural", 4096, NULL, 2, NULL, 0); 
-
-    Serial.println("[Kernel AP] Sistema distribuido inicializado.");
-}
-
-void TaskRedeServidor(void *pvParameters) {
-    esp_task_wdt_add(NULL);
-    char packetBuffer[128]; // Modificado para array fixo de tamanho seguro
-    
-    for(;;) {
-        esp_task_wdt_reset();
-        portalWeb.atualizar();
-
-        int packetSize = udpSocket.parsePacket();
-        if (packetSize && packetSize < (int)sizeof(packetBuffer)) {
-            int len = udpSocket.read(packetBuffer, sizeof(packetBuffer) - 1);
-            if (len > 0) {
-                packetBuffer[len] = 0;
-                xQueueSend(xFilaPacotes, &packetBuffer, 0);
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-}
-
-void TaskProcessamentoNeural(void *pvParameters) {
-    esp_task_wdt_add(NULL);
-    char bufferLeitura[128]; // Modificado para array fixo de tamanho seguro
-    TelemetriaIA dadosEnvio;
-
-    for(;;) {
-        esp_task_wdt_reset();
-        
-        if (xQueueReceive(xFilaPacotes, &bufferLeitura, pdMS_TO_TICKS(500)) == pdTRUE) {
-            String pacoteTexto = String(bufferLeitura);
-            
-            bool ok = cerebroLocal.atualizarMetricas(pacoteTexto);
-            if (ok) {
-                cerebroLocal.obterTelemetria(dadosEnvio);
-                portalWeb.dispararStream(dadosEnvio, esp_get_free_heap_size(), millis() / 1000);
-
-                // Gravacao condicional estavel na Flash
-                if (dadosEnvio.total_ciclos % 500 == 0) {
-                    if (xMutexFlash != NULL && xSemaphoreTake(xMutexFlash, pdMS_TO_TICKS(10)) == pdTRUE) {
-                        flashMemory.begin("dist_ia", false);
-                        flashMemory.putUInt("ciclos", dadosEnvio.total_ciclos);
-                        flashMemory.putUInt("anomalias", dadosEnvio.total_anomalias);
-                        flashMemory.end();
-                        xSemaphoreGive(xMutexFlash);
-                    }
-                }
-            }
-        }
-    }
-}
-
-void loop() {
-    vTaskDelay(pdMS_TO_TICKS(1000));
-}
+public:
+    ServidorAssincrono();
+    void inicializar();
+    void atualizar();
+    void dispararStream(const TelemetriaIA& dados, uint32_t heap, uint32_t uptime);
+    void gerenciarWS(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+};
