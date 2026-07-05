@@ -1,0 +1,80 @@
+#pragma once
+#include <Arduino.h>
+
+#define JANELA_TEMPORAL 50 
+
+struct TelemetriaIA {
+    float valor_atual;
+    float previsao;
+    float erro;
+    float peso;
+    float bias;
+    float taxa_aprendizado;
+    float media;
+    float desvio_padrao;
+    float mae;
+    float mse;
+    float rmse;
+    float r_quadrado;
+    float confianca;
+    uint32_t total_ciclos;
+    uint32_t total_anomalias;
+    uint32_t timestamp;
+};
+
+// Estrutura interna para suportar a função legada de estatísticas sem travar
+struct EstatisticasIA {
+    float media = 0.0f;
+    float variancia = 0.0f;
+    float desvio_padrao = 0.0f;
+    float mae = 0.0f;
+    float mse = 0.0f;
+    float rmse = 0.0f;
+    float confianca = 100.0f;
+};
+
+class MotorIA {
+private:
+    float historico[JANELA_TEMPORAL];
+    int index_hist;
+    int elementos_hist;
+
+    float peso;
+    float bias;
+    float taxa_aprendizado;
+
+    float curto_prazo;
+    float medio_prazo;
+    float longo_prazo;
+
+    double welford_m;
+    double welford_s;
+    uint32_t contagem_welford;
+
+    double soma_erro_abs;
+    double soma_erro_quad;
+    double soma_total_quad; 
+
+    uint32_t total_ciclos;
+    uint32_t total_anomalias;
+
+    EstatisticasIA estatisticas;
+
+    void atualizarWelford(float valor);
+
+public:
+    MotorIA();
+    void inicializar();
+    void configurarPesos(float p, float b, uint32_t ciclos, uint32_t anomalias);
+    
+    float aplicarFiltroAdaptativo(float bruto);
+    bool processarAmostra(float valor_bruto, float& out_prev, float& out_erro);
+    
+    void calcularEstatisticasAvancadas();
+    void obterTelemetria(TelemetriaIA& dest);
+    void obterJanelaJSON(char* buffer_dest, size_t max_len);
+
+    EstatisticasIA getEstatisticas() { return estatisticas; }
+    float getPeso() { return peso; }
+    float getBias() { return bias; }
+};
