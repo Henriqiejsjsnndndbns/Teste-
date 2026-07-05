@@ -1,0 +1,95 @@
+#include "ia_engine.h"
+#include <algorithm>
+#include <cmath>
+
+MotorIA::MotorIA() {}
+
+void MotorIA::inicializar() {
+    memset(buffer, 0, sizeof(buffer));
+}
+
+void MotorIA::carregarPesos(float p, float b, uint32_t ciclos, uint32_t anomalias) {
+    if (!isnan(p) && !isinf(p)) peso = p;
+    if (!isnan(b) && !isinf(b)) bias = b;
+    estatisticas.total_ciclos = ciclos;
+    estatisticas.total_anomalias = anomalias;
+}
+
+float MotorIA::aplicarFiltroRuado(float valor_bruto) {
+    // Filtro Passa-Baixas Exponencial (Média móvel otimizada)
+    curto_prazo = (0.7f * valor_bruto) + (0.3f * curto_prazo);
+    medio_prazo = (0.95f * curto_prazo) + (0.05f * medio_prazo);
+    return curto_prazo;
+}
+
+bool MotorIA::processarAmostra(float valor_bruto, float& out_previsao, float& out_erro) {
+    float valor_filtrado = aplicarFiltroRuado(valor_bruto);
+
+    // 1. Inserção no Buffer Temporal Temporal de 1000 posições
+    buffer[index_buffer] = valor_filtrado;
+    index_buffer = (index_buffer + 1) % BUFFER_TAMANHO;
+    if (total_elementos < BUFFER_TAMANHO) total_elementos++;
+
+    // 2. Cálculo Estatístico para Detecção de Anomalias (Z-Score Simplificado)
+    if (total_elementos > 30) {
+        calcularEstatisticasAvançadas();
+        float z_score = abs(valor_filtrado - estatisticas.media) / (estatisticas.desvio_padrao + 0.001f);
+        if (z_score > 3.5f) { // Mudança abrupta ou anomalia estatística detectada
+            estatisticas.total_anomalias++;
+            return false; // Descarta amostra corrompida para proteger os pesos contra Overfitting
+        }
+    }
+
+    // 3. Predição Linear Forward
+    out_previsao = (valor_filtrado * peso) + bias;
+    out_erro = valor_filtrado - out_previsao;
+
+    // 4. Adaptação Dinâmica da Taxa de Aprendizado (Anti-Explosão de Gradiente)
+    float erro_abs = abs(out_erro);
+    if (erro_abs > 100.0f) taxa_aprendizado = 0.001f; // Reduz em picos para não quebrar o modelo
+    else if (erro_abs > 20.0f) taxa_aprendizado = 0.08f; // Resposta rápida a mudanças de comportamento
+    else taxa_aprendizado = 0.01f; // Ajuste fino adaptativo
+
+    // 5. Aprendizado Online via SGD (Stochastic Gradient Descent) com regularização L2 contra Overfitting
+    float regularizacao_l2 = 0.01f * peso;
+    peso += taxa_aprendizado * (out_erro * (valor_filtrado / (valor_filtrado + 1.0f)) - regularizacao_l2);
+    bias += taxa_aprendizado * out_erro * 0.1f;
+
+    // Guardrail contra NaN ou Infinito
+    if (isnan(peso) || isinf(peso)) peso = 0.5f;
+    if (isnan(bias) || isinf(bias)) bias = 0.0f;
+
+    estatisticas.total_ciclos++;
+    return true;
+}
+
+void MotorIA::calcularEstatisticasAvançadas() {
+    float soma = 0;
+    for (int i = 0; i < total_elementos; i++) soma += buffer[i];
+    estatisticas.media = soma / total_elementos;
+
+    float soma_var = 0;
+    float soma_mae = 0;
+    float soma_mse = 0;
+
+    for (int i = 0; i < total_elementos; i++) {
+        float diff = buffer[i] - estatisticas.media;
+        soma_var += diff * diff;
+        
+        float pred = (buffer[i] * peso) + bias;
+        float err = buffer[i] - pred;
+        soma_mae += abs(err);
+        soma_mse += err * err;
+    }
+
+    estatisticas.variancia = soma_var / total_elementos;
+    estatisticas.desvio_padrao = sqrt(estatisticas.variancia);
+    estatisticas.mae = soma_mae / total_elementos;
+    estatisticas.mse = soma_mse / total_elementos;
+    estatisticas.rmse = sqrt(estatisticas.mse);
+
+    // Métrica de Confiança Inversa baseada no RMSE
+    estatisticas.confianca = 100.0f - (estatisticas.rmse * 0.5f);
+    if (estatisticas.confianca < 0.0f) estatisticas.confianca = 0.0f;
+    if (estatisticas.confianca > 100.0f) estatisticas.confianca = 100.0f;
+}
