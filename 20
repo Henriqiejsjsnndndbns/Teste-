@@ -1,0 +1,118 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <Preferences.h>
+#include <esp_task_wdt.h>
+#include "ia_engine.h"
+#include "web_server.h"
+
+// Definições de Watchdog
+#define WDT_TIMEOUT_SECONDS 8
+
+// Objetos de Contexto do Sistema
+WiFiUDP udpClient;
+unsigned int portaUdp = 12345;
+char bufferUdp[256];
+
+MotorIA cérebro;
+ServidorPainel painelWeb;
+Preferences memoriaFlash;
+
+// Semáforos para Threads Concorrentes
+SemaphoreHandle_t xMutexIA;
+
+// Handlers das Tarefas do FreeRTOS
+TaskHandle_t xTaskNetHandle = NULL;
+TaskHandle_t xTaskIAHandle = NULL;
+
+// Protótipos de Funções das Linhas de Execução do RTOS
+void TaskRede(void *pvParameters);
+void TaskProcessamentoIA(void *pvParameters);
+
+void setup() {
+    Serial.begin(115200);
+    xMutexIA = xSemaphoreCreateMutex();
+
+    // 1. Inicializa o Watchdog do Sistema (Prevenção contra travamento de Threads)
+    esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
+    esp_task_wdt_add(NULL); 
+
+    // 2. Recuperação NVS Segura via Preferences (Carrega Aprendizado Anterior)
+    memoriaFlash.begin("ia_core", false);
+    float p = memoriaFlash.getFloat("peso", 0.5f);
+    float b = memoriaFlash.getFloat("bias", 0.0f);
+    uint32_t c = memoriaFlash.getUInt("ciclos", 0);
+    uint32_t a = memoriaFlash.getUInt("anomalias", 0);
+    cérebro.carregarPesos(p, b, c, a);
+    memoriaFlash.end();
+
+    cérebro.inicializar();
+
+    // 3. Inicialização Segura da Infraestrutura de Rede (Modo Híbrido: AP + STA)
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP("ESP32_IA_Network", "ia_password_123");
+    painelWeb.inicializar();
+    udpClient.begin(portaUdp);
+
+    // 4. Criação de Tasks Escaladas e Alocadas em Núcleos Diferentes (Dual Core Ativo)
+    xTaskCreatePinnedToCore(TaskRede, "TaskRede", 4096, NULL, 1, &xTaskNetHandle, 1); // Núcleo 1 (Rede e HTTP)
+    xTaskCreatePinnedToCore(TaskProcessamentoIA, "TaskIA", 8192, NULL, 2, &xTaskIAHandle, 0); // Núcleo 0 (Matematica TinyML)
+
+    Serial.println("[Kernel] Sistema de Tempo Real Iniciado perfeitamente.");
+}
+
+void TaskRede(void *pvParameters) {
+    esp_task_wdt_add(NULL); // Vincula o WDT a esta thread
+    for(;;) {
+        esp_task_wdt_reset(); // Alimenta o cão de guarda
+        painelWeb.processarEventos();
+        vTaskDelay(pdMS_TO_TICKS(10)); // Libera a CPU para tarefas internas do silício
+    }
+}
+
+void TaskProcessamentoIA(void *pvParameters) {
+    esp_task_wdt_add(NULL);
+    for(;;) {
+        esp_task_wdt_reset();
+        int packetSize = udpClient.parsePacket();
+        
+        if (packetSize) {
+            int len = udpClient.read(bufferUdp, 255);
+            if (len > 0) {
+                bufferUdp[len] = 0;
+                String dados = String(bufferUdp);
+                int idx = dados.indexOf('|');
+                
+                if(idx != -1) {
+                    float valor_atual = dados.substring(0, idx).toFloat();
+                    float previsao = 0.0f, erro = 0.0f;
+                    
+                    // Operação de proteção mutável concorrente (Mutex Guard)
+                    xSemaphoreTake(xMutexIA, portMAX_DELAY);
+                    bool valido = cérebro.processarAmostra(valor_atual, previsao, erro);
+                    
+                    if (valido) {
+                        painelWeb.dispararTelemetria(valor_atual, previsao, erro, cérebro);
+                        
+                        // Gravação não-bloqueante na Flash a cada 500 interações estáveis
+                        if(cérebro.getEstatisticas().total_ciclos % 500 == 0) {
+                            memoriaFlash.begin("ia_core", false);
+                            memoriaFlash.putFloat("peso", cérebro.getPeso());
+                            memoriaFlash.putFloat("bias", cérebro.getBias());
+                            memoriaFlash.putUInt("ciclos", cérebro.getEstatisticas().total_ciclos);
+                            memoriaFlash.putUInt("anomalias", cérebro.getEstatisticas().total_anomalias);
+                            memoriaFlash.end();
+                        }
+                    }
+                    xSemaphoreGive(xMutexIA);
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(2)); // Amostragem ultrarrápida no Core 0
+    }
+}
+
+void loop() {
+    // Loop principal desalocado para impedir vazamento de memória ou gargalo nas Tasks do FreeRTOS
+    vTaskDelete(NULL);
+}
