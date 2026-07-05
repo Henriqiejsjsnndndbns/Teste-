@@ -1,0 +1,74 @@
+#include "web_server.h"
+#include <esp_system.h>
+
+ServidorPainel::ServidorPainel() : server(80), webSocket(81) {}
+
+// HTML/JS de Alta Eficiência compactado em Memória Flash
+const char INDEX_HTML[] PROGMEM = R"=====(
+<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Core IA Dashboard</title>
+<script src='https://jsdelivr.net'></script>
+<style>
+ body { font-family: 'Segoe UI', sans-serif; background: #121214; color: #fff; margin: 0; padding: 20px; }
+ .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; }
+ .card { background: #202024; padding: 15px; border-radius: 8px; border-left: 4px solid #04d361; }
+ .chart-container { background: #202024; padding: 20px; border-radius: 8px; margin-top: 20px; height: 350px; }
+</style></head><body>
+ <h2>● RTOS Core Neural Telemetria</h2>
+ <div class='grid'>
+  <div class='card'><div>VALOR ATUAL</div><h3 id='at'>0.0</h3></div>
+  <div class='card' style='border-color:#8257e5'><div>PREVISÃO IA</div><h3 id='pr'>0.0</h3></div>
+  <div class='card' style='border-color:#ffcd1e'><div>CONFIANÇA</div><h3 id='cf'>100%</h3></div>
+  <div class='card' style='border-color:#f75a68'><div>ANOMALIAS</div><h3 id='an'>0</h3></div>
+  <div class='card' style='border-color:#00bfff'><div>RAM LIVRE</div><h3 id='ram'>0 KB</h3></div>
+ </div>
+ <div class='chart-container'><canvas id='ctxChart'></canvas></div>
+ <script>
+  let ctx = document.getElementById('ctxChart').getContext('2d');
+  let chart = new Chart(ctx, {
+   type: 'line',
+   data: { labels: [], datasets: [
+    { label: 'Real', borderColor: '#04d361', data: [], fill: false },
+    { label: 'Previsão', borderColor: '#8257e5', data: [], fill: false }
+   ]},
+   options: { responsive: true, maintainAspectRatio: false }
+  });
+  let ws = new WebSocket('ws://' + window.location.hostname + ':81/');
+  ws.onmessage = function(e) {
+   let d = JSON.parse(e.data);
+   document.getElementById('at').innerText = d.at;
+   document.getElementById('pr').innerText = d.pr;
+   document.getElementById('cf').innerText = d.cf + '%';
+   document.getElementById('an').innerText = d.an;
+   document.getElementById('ram').innerText = d.ram + ' KB';
+   
+   if(chart.data.labels.length > 30) { chart.data.labels.shift(); chart.data.datasets[0].data.shift(); chart.data.datasets[1].data.shift(); }
+   chart.data.labels.push(new Date().toLocaleTimeString());
+   chart.data.datasets[0].data.push(d.at);
+   chart.data.datasets[1].data.push(d.pr);
+   chart.update();
+  };
+ </script>
+</body></html>
+)=====";
+
+void ServidorPainel::inicializar() {
+    server.on("/", [this]() { server.send(200, "text/html", INDEX_HTML); });
+    server.begin();
+    webSocket.begin();
+}
+
+void ServidorPainel::processarEventos() {
+    server.handleClient();
+    webSocket.loop();
+}
+
+void ServidorPainel::dispararTelemetria(float atual, float prev, float erro, MotorIA& motor) {
+    EstatisticasIA est = motor.getEstatisticas();
+    String json = "{\"at\":" + String(atual, 1) + 
+                  ",\"pr\":" + String(prev, 1) + 
+                  ",\"er\":" + String(erro, 1) + 
+                  ",\"cf\":" + String(est.confianca, 1) + 
+                  ",\"an\":" + String(est.total_anomalias) + 
+                  ",\"ram\":" + String(esp_get_free_heap_size() / 1024) + "}";
+    webSocket.broadcastTXT(json);
+}
