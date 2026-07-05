@@ -1,0 +1,16 @@
+#pragma once
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include "ia_engine.h"
+
+class ServidorPainel {
+private:
+    WebServer server;
+    WebSocketsServer webSocket;
+    
+public:
+    ServidorPainel();
+    void inicializar();
+    void processarEventos();
+    void dispararTelemetria(float atual, float prev, float erro, MotorIA& motor);
+};
