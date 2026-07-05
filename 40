@@ -1,0 +1,141 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <Preferences.h>
+#include <esp_task_wdt.h>
+#include "ia_engine.h"
+#include "web_server.h"
+
+// Definição de Limites de Hardware do Watchdog
+#define WATCHDOG_TIMOUT_SECS 10
+
+// Canais de Comunicação Assíncronos Inter-Task (FreeRTOS Queues)
+QueueHandle_t xFilaUdpDados = NULL;
+
+// Semáforo Mutex de Proteção dos Recursos de Persistência NVS
+SemaphoreHandle_t xMutexNVS = NULL;
+
+WiFiUDP udpServidor;
+unsigned int portaUdp = 12345;
+
+MotorIA processadorIA;
+ServidorAssincrono webInterface;
+Preferences nvMemory;
+
+// Protótipos das Tasks do Core RTOS
+void TaskComunicacaoRede(void *pvParameters);
+void TaskAlgoritmoNeural(void *pvParameters);
+
+void setup() {
+    Serial.begin(115200);
+    
+    // 1. Instanciação dos Mecanismos de Sincronização de Threads
+    xFilaUdpDados = xQueueCreate(20, sizeof(float)); // Buffer fila de prevenção de overhead
+    xMutexNVS = xSemaphoreCreateMutex();
+
+    // 2. Configuração Básica do Watchdog de Hardware do Sistema
+    esp_task_wdt_init(WATCHDOG_TIMOUT_SECS, true);
+    esp_task_wdt_add(NULL); 
+
+    // 3. Restauração Não Volátil Segura de Pesos Neurais (Preferences API)
+    if (xMutexNVS != NULL && xSemaphoreTake(xMutexNVS, portMAX_DELAY) == pdTRUE) {
+        nvMemory.begin("ia_nvs", true); // Abre em modo somente leitura primeiro
+        float p = nvMemory.getFloat("p_syn", 0.5f);
+        float b = nvMemory.getFloat("b_syn", 0.0f);
+        uint32_t c = nvMemory.getUInt("c_total", 0);
+        uint32_t a = nvMemory.getUInt("a_total", 0);
+        processadorIA.configurarPesos(p, b, c, a);
+        nvMemory.end();
+        xSemaphoreGive(xMutexNVS);
+        Serial.println("[NVS Kernel] Estados neurais regenerados com sucesso.");
+    }
+
+    processadorIA.inicializar();
+
+    // 4. Inicialização Robusta e Estabilização do Rádio Wi-Fi (Modo AP Ativo)
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("ESP32_IA_Network", "ia_password_123", 1, 0, 4); // Canal 1, Oculto=Não, Máx Conexões=4
+    
+    webInterface.inicializar();
+    udpServidor.begin(portaUdp);
+
+    // 5. Instanciação e Fixação Estrita de Tasks nos Dois Núcleos Físicos (Dual Core Ativo)
+    // Task de Rede e Interface fixa no Core 1 (Gerencia Wi-Fi, WebSockets e HTTP assíncrono)
+    xTaskCreatePinnedToCore(TaskComunicacaoRede, "TaskNet", 4096, NULL, 1, NULL, 1);
+    
+    // Task de Processamento Matemático e Inferência Neural fixa no Core 0 (Isolada de Rádio para evitar lag de ciclo)
+    xTaskCreatePinnedToCore(TaskAlgoritmoNeural, "TaskNeural", 4096, NULL, 2, NULL, 0);
+
+    Serial.println("[Core RTOS] Kernel Multitarefa operando perfeitamente.");
+}
+
+void TaskComunicacaoRede(void *pvParameters) {
+    esp_task_wdt_add(NULL); // Registra a Task atual no Watchdog de Hardware
+    
+    char packetBuffer[64]; // Reduzido e alocado estaticamente em stack para evitar estouro
+    
+    for(;;) {
+        esp_task_wdt_reset(); // Alimenta o Watchdog de Hardware
+        webInterface.atualizar();
+
+        // Escuta Não-Bloqueante de Pacotes Brutos UDP
+        int packetSize = udpServidor.parsePacket();
+        if (packetSize && packetSize < (int)sizeof(packetBuffer)) {
+            int len = udpServidor.read(packetBuffer, sizeof(packetBuffer) - 1);
+            if (len > 0) {
+                packetBuffer[len] = 0;
+                // Parse direto sem geração de Strings dinâmicas na heap
+                char* token = strchr(packetBuffer, '|');
+                float valor_bruto = (token != nullptr) ? strtof(packetBuffer, nullptr) : strtof(packetBuffer, nullptr);
+                
+                // Despacha o valor bruto diretamente para a fila de execução matemática do Core 0
+                xQueueSend(xFilaUdpDados, &valor_bruto, 0);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(5)); // Cede fatias de processamento da CPU
+    }
+}
+
+void TaskAlgoritmoNeural(void *pvParameters) {
+    esp_task_wdt_add(NULL);
+    float valor_recebido = 0.0f;
+    TelemetriaIA dados_locais;
+
+    for(;;) {
+        esp_task_wdt_reset();
+        
+        // Bloqueio inteligente baseado em eventos: Acorda imediatamente quando dados chegam na fila UDP
+        if (xQueueReceive(xFilaUdpDados, &valor_recebido, pdMS_TO_TICKS(500)) == pdTRUE) {
+            float pr = 0.0f, er = 0.0f;
+            
+            // Processa a amostra aplicando Filtros e Gradiente Descendente
+            bool sucesso = processadorIA.processarAmostra(valor_recebido, pr, er);
+            
+            if (sucesso) {
+                processadorIA.obterTelemetria(dados_locais);
+                
+                // Dispara os dados calculados para o buffer de transmissão WebSocket
+                webInterface.transmitirTelemetria(dados_locais, esp_get_free_heap_size(), millis() / 1000);
+
+                // Persistência inteligente: Salva na Flash apenas a cada 1000 iterações estáveis (Evita desgaste)
+                if (dados_locais.total_ciclos % 1000 == 0) {
+                    if (xMutexNVS != NULL && xSemaphoreTake(xMutexNVS, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        nvMemory.begin("ia_nvs", false); // Abre em Modo Leitura/Escrita
+                        nvMemory.putFloat("p_syn", dados_locais.peso);
+                        nvMemory.putFloat("b_syn", dados_locais.bias);
+                        nvMemory.putUInt("c_total", dados_locais.total_ciclos);
+                        nvMemory.putUInt("a_total", dados_locais.total_anomalias);
+                        nvMemory.end();
+                        xSemaphoreGive(xMutexNVS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void loop() {
+    // Desaloca permanentemente o loop nativo do Arduino para evitar redundâncias na pilha RTOS
+    vTaskDelete(NULL);
+}
