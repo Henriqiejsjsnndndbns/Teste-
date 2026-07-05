@@ -1,0 +1,8 @@
+[env:esp32-s3-devkitc-1]
+platform = espressif32
+board = esp32-s3-devkitc-1
+framework = arduino
+
+; Adicione ou atualize esta linha abaixo com as dependências do projeto
+lib_deps =
+    Links2004/WebSockets @ ^2.4.1
