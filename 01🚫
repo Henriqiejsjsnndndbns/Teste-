@@ -1,21 +1,86 @@
-#pragma once
-#include <Arduino.h>
+#include "web_server.h"
 #include <WebServer.h>
 #include <WebSocketsServer.h>
-#include "ia_engine.h"
 
-class ServidorAssincrono {
-private:
-    WebServer server;
-    WebSocketsServer webSocket;
-    uint8_t clientes;
+// Interface Grafica integrada na memoria Flash do ESP32 via WebSocket
+const char ServidorAssincrono::INDEX_HTML[] PROGMEM = R"=====(
+<!DOCTYPE html><html lang='pt-BR'><head><meta charset='UTF-8'><title>Distributed Predictive IA</title>
+<script src='https://jsdelivr.net'></script>
+<style>
+ :root{--bg:#0f0f12;--surface:#17171f;--text:#f1f1f4;--primary:#00e676;--purple:#d500f9;--danger:#ff1744}
+ body{font-family:'Segoe UI',sans-serif;background:var(--bg);color:var(--text);margin:0;padding:20px}
+ .container{max-width:1200px;margin:auto}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:15px;margin-bottom:20px}
+ .card{background:var(--surface);padding:20px;border-radius:12px;border-left:5px solid var(--primary);box-shadow:0 4px 15px rgba(0,0,0,0.3)}
+ .title{font-size:11px;color:#9e9e9e;font-weight:bold;text-transform:uppercase;letter-spacing:1px}
+ .value{font-size:22px;font-weight:bold;margin-top:6px;word-break:break-all}
+ .chart-box{background:var(--surface);padding:20px;border-radius:12px;height:380px}
+</style></head><body>
+<div class='container'>
+ <h2>● Monitor de IA Distribuída (FreeRTOS Core Stream)</h2>
+ <div class='grid'>
+  <div class='card'><div class='title'>Estado Capturado</div><div class='value' id='at'>Aguardando...</div></div>
+  <div class='card' style='border-color:var(--purple)'><div class='title'>🔮 Previsão Próxima Ação</div><div class='value' id='pr'>Calculando...</div></div>
+  <div class='card' style='border-color:#ffea00'><div class='title'>Confiança da Previsão</div><div class='value' id='cf'>0.0%</div></div>
+  <div class='card' style='border-color:#00e5ff'><div class='card-title' style='font-size:11px;color:#9e9e9e;font-weight:bold;'>Precisão Acumulada</div><div class='value' id='pc'>0.0%</div></div>
+  <div class='card' style='border-color:var(--danger)'><div class='title'>Anomalias Comportamento</div><div class='value' id='an'>0</div></div>
+  <div class='card' style='border-color:#ff9100'><div class='title'>RAM Livre Cache</div><div class='value' id='ram'>0 KB</div></div>
+ </div>
+ <div class='chart-box'><canvas id='graficoLinha'></canvas></div>
+</div>
+<script>
+ let ctx=document.getElementById('graficoLinha').getContext('2d');
+ let chart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[
+  {label:'Confiança (%)',borderColor:'#00e676',data:[],tension:0.2,fill:false},
+  {label:'Precisão Acumulada (%)',borderColor:'#00e5ff',data:[],tension:0.2,fill:false}
+ ]},options:{responsive:true,maintainAspectRatio:false,scales:{y:{min:0,max:100,grid:{color:'rgba(255,255,255,0.05)'}},x:{grid:{color:'rgba(255,255,255,0.05)'}}}}});
+ 
+ let ws=new WebSocket('ws://'+window.location.hostname+':81/');
+ ws.onmessage=function(e){
+  let d=JSON.parse(e.data);
+  document.getElementById('at').innerText=d.at;
+  document.getElementById('pr').innerText=d.pr;
+  document.getElementById('cf').innerText=d.cf.toFixed(1)+'%';
+  document.getElementById('pc').innerText=d.pc.toFixed(1)+'%';
+  document.getElementById('an').innerText=d.an;
+  document.getElementById('ram').innerText=d.ram+' KB';
+  
+  if(chart.data.labels.length>30){chart.data.labels.shift();chart.data.datasets.data.shift();chart.data.datasets.data.shift();}
+  chart.data.labels.push(new Date().toLocaleTimeString());
+  chart.data.datasets.data.push(d.cf);
+  chart.data.datasets.data.push(d.pc);
+  chart.update();
+ };
+</script></body></html>
+)=====";
 
-    static const char INDEX_HTML[] PROGMEM;
+ServidorAssincrono::ServidorAssincrono() : server(80), webSocket(81), clientes(0) {}
 
-public:
-    ServidorAssincrono();
-    void inicializar();
-    void atualizar();
-    void dispararStream(const TelemetriaIA& dados, uint32_t heap, uint32_t uptime);
-    void gerenciarWS(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
-};
+void ServidorAssincrono::inicializar() {
+    server.on("/", [this]() { server.send_P(200, "text/html", INDEX_HTML); });
+    server.begin();
+    webSocket.begin();
+    webSocket.onEvent([this](uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+        this->gerenciarWS(num, type, payload, length);
+    });
+}
+
+void ServidorAssincrono::gerenciarWS(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+    if (type == WStype_CONNECTED) clientes++;
+    else if (type == WStype_DISCONNECTED) { if(clientes > 0) clientes--; }
+}
+
+void ServidorAssincrono::atualizar() {
+    server.handleClient();
+    webSocket.loop();
+}
+
+void ServidorAssincrono::dispararStream(const TelemetriaIA& dados, uint32_t heap, uint32_t uptime) {
+    if (clientes == 0) return;
+    char json_buffer[256]; // Corrigido: Agora sim um array de 256 bytes explícito
+    snprintf(json_buffer, sizeof(json_buffer),
+             "{\"at\":\"%s\",\"pr\":\"%s\",\"cf\":%.1f,\"pc\":%.1f,\"an\":%u,\"ram\":%u}",
+             dados.estado_atual, dados.previsao, dados.confianca, dados.precisao,
+             dados.total_anomalias, heap / 1024);
+    webSocket.broadcastTXT((uint8_t*)json_buffer, strlen(json_buffer));
+}
