@@ -1,0 +1,49 @@
+#pragma once
+#include <Arduino.h>
+
+#define BUFFER_TAMANHO 1000
+
+struct EstatisticasIA {
+    float media = 0.0f;
+    float mediana = 0.0f;
+    float variancia = 0.0f;
+    float desvio_padrao = 0.0f;
+    float mae = 0.0f;
+    float mse = 0.0f;
+    float rmse = 0.0f;
+    uint32_t total_ciclos = 0;
+    uint32_t total_anomalias = 0;
+    float confianca = 100.0f;
+};
+
+class MotorIA {
+private:
+    float buffer[BUFFER_TAMANHO];
+    int index_buffer = 0;
+    int total_elementos = 0;
+
+    // Pesos da Rede Neural (Longo Prazo)
+    float peso = 0.5f;
+    float bias = 0.0f;
+    float taxa_aprendizado = 0.05f;
+
+    // Filtros (Curto e Médio Prazo)
+    float curto_prazo = 0.0f;
+    float medio_prazo = 0.0f;
+
+    EstatisticasIA estatisticas;
+    void calcularEstatisticasAvançadas();
+
+public:
+    MotorIA();
+    void inicializar();
+    float aplicarFiltroRuado(float valor_bruto);
+    bool processarAmostra(float valor_bruto, float& out_previsao, float& out_erro);
+    
+    // Getters e Setters para sincronização
+    EstatisticasIA getEstatisticas() { return estatisticas; }
+    float getPeso() { return peso; }
+    float getBias() { return bias; }
+    float getTaxa() { return taxa_aprendizado; }
+    void carregarPesos(float p, float b, uint32_t ciclos, uint32_t anomalias);
+};
