@@ -47,10 +47,10 @@ const char INDEX_HTML[] PROGMEM = R"=====(
   document.getElementById('up').innerText=d.up+'s';
   
   historicoCompleto.push({ts:new Date().toLocaleTimeString(),at:d.at,pr:d.pr});
-  if(chart.data.labels.length>40){chart.data.labels.shift();chart.data.datasets[0].data.shift();chart.data.datasets[1].data.shift();}
+  if(chart.data.labels.length>40){chart.data.labels.shift();chart.data.datasets.data.shift();chart.data.datasets.data.shift();}
   chart.data.labels.push(new Date().toLocaleTimeString());
-  chart.data.datasets[0].data.push(d.at);
-  chart.data.datasets[1].data.push(d.pr);
+  chart.data.datasets.data.push(d.at);
+  chart.data.datasets.data.push(d.pr);
   chart.update();
  };
  function toggleTheme(){document.body.classList.toggle('light-theme');}
@@ -71,15 +71,16 @@ void ServidorAssincrono::inicializar() {
     server.begin();
     
     webSocket.begin();
-    webSocket.onEvent([this](uint8_t num, W_TYPE type, uint8_t * payload, size_t length) {
+    webSocket.onEvent([this](uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
         this->gerenciarEventoWS(num, type, payload, length);
     });
 }
 
-void ServidorAssincrono::gerenciarEventoWS(uint8_t num, W_TYPE type, uint8_t * payload, size_t length) {
-    if (type == W_CONNECTED) {
+// Corrigido: Atualizado para receber WStype_t condizente com a biblioteca
+void ServidorAssincrono::gerenciarEventoWS(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+    if (type == WStype_CONNECTED) {
         clientes_conectados++;
-    } else if (type == W_DISCONNECTED) {
+    } else if (type == WStype_DISCONNECTED) {
         if (clientes_conectados > 0) clientes_conectados--;
     }
 }
@@ -92,6 +93,7 @@ void ServidorAssincrono::atualizar() {
 void ServidorAssincrono::transmitirTelemetria(const TelemetriaIA& dados, uint32_t ram_livre, uint32_t uptime) {
     if (clientes_conectados == 0) return;
     
+    // Corrigido: Definido o array estático com tamanho seguro de 256 bytes
     char json_buffer[256];
     snprintf(json_buffer, sizeof(json_buffer),
              "{\"at\":%.2f,\"pr\":%.2f,\"er\":%.2f,\"cf\":%.2f,\"an\":%u,\"ram\":%u,\"up\":%u}",
