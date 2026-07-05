@@ -16,6 +16,6 @@ public:
     void transmitirTelemetria(const TelemetriaIA& dados, uint32_t ram_livre, uint32_t uptime);
     uint8_t getClientesConectados() const { return clientes_conectados; }
     
-    // Handler interno de eventos WebSocket
-    void gerenciarEventoWS(uint8_t num, W_TYPE type, uint8_t * payload, size_t length);
+    // Corrigido: Alterado de W_TYPE para WStype_t que é o padrão da biblioteca
+    void gerenciarEventoWS(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
 };
