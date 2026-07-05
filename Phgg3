@@ -1,0 +1,153 @@
+#include "ia_engine.h"
+#include <cmath>
+#include <algorithm>
+
+MotorIA::MotorIA() : index_hist(0), elementos_hist(0), peso(0.5f), bias(0.0f), 
+                     taxa_aprendizado(0.05f), curto_prazo(0.0f), medio_prazo(0.0f), longo_prazo(0.0f),
+                     welford_m(0.0), welford_s(0.0), contagem_welford(0),
+                     soma_erro_abs(0.0), soma_erro_quad(0.0), soma_total_quad(0.0),
+                     total_ciclos(0), total_anomalias(0) {
+    memset(historico, 0, sizeof(historico));
+}
+
+void MotorIA::inicializar() {
+    curto_prazo = medio_prazo = longo_prazo = 0.0f;
+}
+
+void MotorIA::configurarPesos(float p, float b, uint32_t ciclos, uint32_t anomalias) {
+    if (!isnan(p) && !isinf(p)) peso = p;
+    if (!isnan(b) && !isinf(b)) bias = b;
+    total_ciclos = ciclos;
+    total_anomalias = anomalias;
+}
+
+void MotorIA::atualizarWelford(float valor) {
+    contagem_welford++;
+    if (contagem_welford == 1) {
+        welford_m = valor;
+        welford_s = 0.0;
+    } else {
+        double antigo_m = welford_m;
+        welford_m += (valor - antigo_m) / contagem_welford;
+        welford_s += (valor - antigo_m) * (valor - welford_m);
+    }
+}
+
+float MotorIA::aplicarFiltroAdaptativo(float bruto) {
+    curto_prazo = (0.6f * bruto) + (0.4f * curto_prazo);
+    medio_prazo = (0.8f * curto_prazo) + (0.2f * medio_prazo);
+    longo_prazo = (0.95f * medio_prazo) + (0.05f * longo_prazo);
+    return medio_prazo;
+}
+
+bool MotorIA::processarAmostra(float valor_bruto, float& out_prev, float& out_erro) {
+    float valor_filtrado = aplicarFiltroAdaptativo(valor_bruto);
+
+    if (contagem_welford > 30) {
+        double desvio = (contagem_welford > 1) ? sqrt(welford_s / (contagem_welford - 1)) : 0.0;
+        if (desvio > 0.1) {
+            double z_score = abs(valor_filtrado - welford_m) / desvio;
+            if (z_score > 4.0) {
+                total_anomalias++;
+                return false;
+            }
+        }
+    }
+
+    atualizarWelford(valor_filtrado);
+
+    historico[index_hist] = valor_filtrado;
+    index_hist = (index_hist + 1) % JANELA_TEMPORAL;
+    if (elementos_hist < JANELA_TEMPORAL) elementos_hist++;
+
+    out_prev = (valor_filtrado * peso) + bias;
+    out_erro = valor_filtrado - out_prev;
+
+    float erro_abs = abs(out_erro);
+    if (erro_abs > 80.0f) {
+        taxa_aprendizado = 0.002f;
+    } else if (erro_abs > 15.0f) {
+        taxa_aprendizado = 0.06f;
+    } else {
+        taxa_aprendizado = 0.01f;
+    }
+
+    float penalizacao_l2 = 0.005f * peso; 
+    peso += taxa_aprendizado * (out_erro * (valor_filtrado / (valor_filtrado + 1.0f)) - penalizacao_l2);
+    bias += taxa_aprendizado * out_erro * 0.1f;
+
+    if (isnan(peso) || isinf(peso)) peso = 0.5f;
+    if (isnan(bias) || isinf(bias)) bias = 0.0f;
+
+    total_ciclos++;
+    soma_erro_abs += erro_abs;
+    soma_erro_quad += (out_erro * out_erro);
+    soma_total_quad += pow(valor_filtrado - welford_m, 2);
+
+    return true;
+}
+
+void MotorIA::calcularEstatisticasAvancadas() {
+    float soma = 0;
+    for (int i = 0; i < total_elementos; i++) soma += buffer[i];
+    estatisticas.media = soma / total_elementos;
+
+    float soma_var = 0;
+    float soma_mae = 0;
+    float soma_mse = 0;
+
+    for (int i = 0; i < total_elementos; i++) {
+        float diff = buffer[i] - estatisticas.media;
+        soma_var += diff * diff;
+        
+        float pred = (buffer[i] * peso) + bias;
+        float err = buffer[i] - pred;
+        soma_mae += abs(err);
+        soma_mse += err * err;
+    }
+
+    estatisticas.variancia = soma_var / total_elementos;
+    estatisticas.desvio_padrao = sqrt(estatisticas.variancia);
+    estatisticas.mae = soma_mae / total_elementos;
+    estatisticas.mse = soma_mse / total_elementos;
+    estatisticas.rmse = sqrt(estatisticas.mse);
+
+    estatisticas.confianca = 100.0f - (estatisticas.rmse * 0.5f);
+    if (estatisticas.confianca < 0.0f) estatisticas.confianca = 0.0f;
+    if (estatisticas.confianca > 100.0f) estatisticas.confianca = 100.0f;
+}
+
+void MotorIA::obterTelemetria(TelemetriaIA& dest) {
+    dest.valor_atual = (elementos_hist > 0) ? historico[(index_hist - 1 + JANELA_TEMPORAL) % JANELA_TEMPORAL] : 0.0f;
+    dest.peso = peso;
+    dest.bias = bias;
+    dest.taxa_aprendizado = taxa_aprendizado;
+    dest.total_ciclos = total_ciclos;
+    dest.total_anomalias = total_anomalias;
+    dest.media = (float)welford_m;
+    dest.desvio_padrao = (contagem_welford > 1) ? (float)sqrt(welford_s / (contagem_welford - 1)) : 0.0f;
+    
+    if (total_ciclos > 0) {
+        dest.mae = (float)(soma_erro_abs / total_ciclos);
+        dest.mse = (float)(soma_erro_quad / total_ciclos);
+        dest.rmse = sqrt(dest.mse);
+        dest.r_quadrado = (soma_total_quad > 0) ? (float)(1.0 - (soma_erro_quad / soma_total_quad)) : 1.0f;
+        
+        float conf = (1.0f - (dest.rmse / 255.0f)) * 100.0f;
+        dest.confianca = constrain(conf, 0.0f, 100.0f);
+    } else {
+        dest.mae = dest.mse = dest.rmse = 0.0f;
+        dest.r_quadrado = 1.0f;
+        dest.confianca = 100.0f;
+    }
+}
+
+void MotorIA::obterJanelaJSON(char* buffer_dest, size_t max_len) {
+    size_t offset = snprintf(buffer_dest, max_len, "[");
+    for (int i = 0; i < elementos_hist; i++) {
+        int idx = (index_hist - elementos_hist + i + JANELA_TEMPORAL) % JANELA_TEMPORAL;
+        offset += snprintf(buffer_dest + offset, max_len - offset, "%.1f%s", historico[idx], (i == elementos_hist - 1) ? "" : ",");
+        if (offset >= max_len) break;
+    }
+    snprintf(buffer_dest + offset, max_len - offset, "]");
+}
