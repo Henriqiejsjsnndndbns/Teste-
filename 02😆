@@ -1,0 +1,102 @@
+#include "web_server.h"
+#include <esp_wifi.h>
+
+// Dashboard em Arquitetura SPA (Single Page Application) Otimizada com Chart.js e CSS Grid reativo
+const char INDEX_HTML[] PROGMEM = R"=====(
+<!DOCTYPE html><html lang='pt-BR'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1.0'>
+<title>Advanced Core IA Embedded</title><script src='https://jsdelivr.net'></script>
+<style>
+ :root{--bg:#121214;--surface:#202024;--text:#e1e1e6;--primary:#04d361;--purple:#8257e5;--danger:#f75a68;--warning:#ffcd1e}
+ .light-theme{--bg:#f0f2f5;--surface:#ffffff;--text:#1c1c1c;--primary:#00a344;--purple:#6236ba}
+ body{font-family:'Segoe UI',sans-serif;background:var(--bg);color:var(--text);margin:0;padding:20px;transition:0.3s}
+ .dashboard{max-width:1200px;margin:auto}
+ .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:15px}
+ .card{background:var(--surface);padding:18px;border-radius:10px;border-left:5px solid var(--primary);box-shadow:0 4px 10px rgba(0,0,0,0.15)}
+ .card-title{font-size:12px;color:#a8a8b3;font-weight:bold;text-transform:uppercase}
+ .card-value{font-size:24px;font-weight:bold;margin-top:5px}
+ .btn{background:var(--primary);color:#fff;border:none;padding:8px 16px;border-radius:5px;cursor:pointer;font-weight:bold}
+ .chart-box{background:var(--surface);padding:20px;border-radius:10px;margin-top:20px;height:380px}
+</style></head><body>
+<div class='dashboard'><div class='header'><h2>🧠 RTOS Neural Stream Telemetria</h2>
+<div><button class='btn' onclick='toggleTheme()'>Tema</button> <button class='btn' style='background:var(--purple)' onclick='exportJSON()'>Exportar</button></div></div>
+<div class='grid'>
+ <div class='card'><div class='card-title'>Entrada Real</div><div class='card-value' id='at'>0.0</div></div>
+ <div class='card' style='border-color:var(--purple)'><div class='card-title'>Previsão IA</div><div class='card-value' id='pr'>0.0</div></div>
+ <div class='card' style='border-color:var(--warning)'><div class='card-title'>Confiança</div><div class='card-value' id='cf'>100%</div></div>
+ <div class='card' style='border-color:var(--danger)'><div class='card-title'>Anomalias</div><div class='card-value' id='an'>0</div></div>
+ <div class='card' style='border-color:#00bfff'><div class='card-title'>RAM Livre</div><div class='card-value' id='ram'>0 KB</div></div>
+ <div class='card' style='border-color:#ff00ff'><div class='card-title'>Uptime</div><div class='card-value' id='up'>0s</div></div>
+</div>
+<div class='chart-box'><canvas id='rtChart'></canvas></div></div>
+<script>
+ let ctx=document.getElementById('rtChart').getContext('2d');
+ let chart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[
+  {label:'Real',borderColor:'#04d361',data:[],tension:0.2,fill:false},
+  {label:'Previsão',borderColor:'#8257e5',data:[],tension:0.2,fill:false}
+ ]},options:{responsive:true,maintainAspectRatio:false,scales:{y:{grid:{color:'rgba(255,255,255,0.05)'}},x:{grid:{color:'rgba(255,255,255,0.05)'}}}}});
+ let historicoCompleto=[];
+ let ws=new WebSocket('ws://'+window.location.hostname+':81/');
+ ws.onmessage=function(e){
+  let d=JSON.parse(e.data);
+  document.getElementById('at').innerText=d.at.toFixed(1);
+  document.getElementById('pr').innerText=d.pr.toFixed(1);
+  document.getElementById('cf').innerText=d.cf.toFixed(1)+'%';
+  document.getElementById('an').innerText=d.an;
+  document.getElementById('ram').innerText=d.ram+' KB';
+  document.getElementById('up').innerText=d.up+'s';
+  
+  historicoCompleto.push({ts:new Date().toLocaleTimeString(),at:d.at,pr:d.pr});
+  if(chart.data.labels.length>40){chart.data.labels.shift();chart.data.datasets[0].data.shift();chart.data.datasets[1].data.shift();}
+  chart.data.labels.push(new Date().toLocaleTimeString());
+  chart.data.datasets[0].data.push(d.at);
+  chart.data.datasets[1].data.push(d.pr);
+  chart.update();
+ };
+ function toggleTheme(){document.body.classList.toggle('light-theme');}
+ function exportJSON(){
+  let dataStr="data:text/json;charset=utf-8,"+encodeURIComponent(JSON.stringify(historicoCompleto));
+  let dlAnchor=document.createElement('a');dlAnchor.setAttribute("href",dataStr);
+  dlAnchor.setAttribute("download","ia_telemetria.json");dlAnchor.click();
+ }
+</script></body></html>
+)=====";
+
+ServidorAssincrono::ServidorAssincrono() : server(80), webSocket(81), clientes_conectados(0) {}
+
+void ServidorAssincrono::inicializar() {
+    server.on("/", [this]() {
+        server.send_P(200, "text/html", INDEX_HTML);
+    });
+    server.begin();
+    
+    webSocket.begin();
+    webSocket.onEvent([this](uint8_t num, W_TYPE type, uint8_t * payload, size_t length) {
+        this->gerenciarEventoWS(num, type, payload, length);
+    });
+}
+
+void ServidorAssincrono::gerenciarEventoWS(uint8_t num, W_TYPE type, uint8_t * payload, size_t length) {
+    if (type == W_CONNECTED) {
+        clientes_conectados++;
+    } else if (type == W_DISCONNECTED) {
+        if (clientes_conectados > 0) clientes_conectados--;
+    }
+}
+
+void ServidorAssincrono::atualizar() {
+    server.handleClient();
+    webSocket.loop();
+}
+
+void ServidorAssincrono::transmitirTelemetria(const TelemetriaIA& dados, uint32_t ram_livre, uint32_t uptime) {
+    if (clientes_conectados == 0) return;
+    
+    char json_buffer[256];
+    snprintf(json_buffer, sizeof(json_buffer),
+             "{\"at\":%.2f,\"pr\":%.2f,\"er\":%.2f,\"cf\":%.2f,\"an\":%u,\"ram\":%u,\"up\":%u}",
+             dados.valor_atual, dados.previsao, dados.erro, dados.confianca,
+             dados.total_anomalias, ram_livre / 1024, uptime);
+             
+    webSocket.broadcastTXT((uint8_t*)json_buffer, strlen(json_buffer));
+}
