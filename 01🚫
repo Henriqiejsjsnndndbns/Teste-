@@ -1,61 +1,84 @@
-#include "ia_engine.h"
-#include <cmath>
+#include "web_server.h"
 
-MotorIA::MotorIA() : welford_m(0.0), welford_s(0.0), contagem_welford(0) {
-    memset(&dados, 0, sizeof(TelemetriaIA));
-    strcpy(dados.estado_atual, "Aguardando...");
-    strcpy(dados.previsao, "Calculando...");
+// Interface Grafica integrada na memoria Flash do ESP32 via WebSocket
+const char ServidorAssincrono::INDEX_HTML[] PROGMEM = R"=====(
+<!DOCTYPE html><html lang='pt-BR'><head><meta charset='UTF-8'><title>Distributed Predictive IA</title>
+<script src='https://jsdelivr.net'></script>
+<style>
+ :root{--bg:#0f0f12;--surface:#17171f;--text:#f1f1f4;--primary:#00e676;--purple:#d500f9;--danger:#ff1744}
+ body{font-family:'Segoe UI',sans-serif;background:var(--bg);color:var(--text);margin:0;padding:20px}
+ .container{max-width:1200px;margin:auto}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:15px;margin-bottom:20px}
+ .card{background:var(--surface);padding:20px;border-radius:12px;border-left:5px solid var(--primary);box-shadow:0 4px 15px rgba(0,0,0,0.3)}
+ .title{font-size:11px;color:#9e9e9e;font-weight:bold;text-transform:uppercase;letter-spacing:1px}
+ .value{font-size:22px;font-weight:bold;margin-top:6px;word-break:break-all}
+ .chart-box{background:var(--surface);padding:20px;border-radius:12px;height:380px}
+</style></head><body>
+<div class='container'>
+ <h2>● Monitor de IA Distribuída (FreeRTOS Core Stream)</h2>
+ <div class='grid'>
+  <div class='card'><div class='title'>Estado Capturado</div><div class='value' id='at'>Aguardando...</div></div>
+  <div class='card' style='border-color:var(--purple)'><div class='title'>🔮 Previsão Próxima Ação</div><div class='value' id='pr'>Calculando...</div></div>
+  <div class='card' style='border-color:#ffea00'><div class='title'>Confiança da Previsão</div><div class='value' id='cf'>0.0%</div></div>
+  <div class='card' style='border-color:#00e5ff'><div class='card-title' style='font-size:11px;color:#9e9e9e;font-weight:bold;'>Precisão Acumulada</div><div class='value' id='pc'>0.0%</div></div>
+  <div class='card' style='border-color:var(--danger)'><div class='title'>Anomalias Comportamento</div><div class='value' id='an'>0</div></div>
+  <div class='card' style='border-color:#ff9100'><div class='title'>RAM Livre Cache</div><div class='value' id='ram'>0 KB</div></div>
+ </div>
+ <div class='chart-box'><canvas id='graficoLinha'></canvas></div>
+</div>
+<script>
+ let ctx=document.getElementById('graficoLinha').getContext('2d');
+ let chart=new Chart(ctx,{type:'line',data:{labels:[],datasets:[
+  {label:'Confiança (%)',borderColor:'#00e676',data:[],tension:0.2,fill:false},
+  {label:'Precisão Acumulada (%)',borderColor:'#00e5ff',data:[],tension:0.2,fill:false}
+ ]},options:{responsive:true,maintainAspectRatio:false,scales:{y:{min:0,max:100,grid:{color:'rgba(255,255,255,0.05)'}},x:{grid:{color:'rgba(255,255,255,0.05)'}}}}});
+ 
+ let ws=new WebSocket('ws://'+window.location.hostname+':81/');
+ ws.onmessage=function(e){
+  let d=JSON.parse(e.data);
+  document.getElementById('at').innerText=d.at;
+  document.getElementById('pr').innerText=d.pr;
+  document.getElementById('cf').innerText=d.cf.toFixed(1)+'%';
+  document.getElementById('pc').innerText=d.pc.toFixed(1)+'%';
+  document.getElementById('an').innerText=d.an;
+  document.getElementById('ram').innerText=d.ram+' KB';
+  
+  if(chart.data.labels.length>30){chart.data.labels.shift();chart.data.datasets.data.shift();chart.data.datasets.data.shift();}
+  chart.data.labels.push(new Date().toLocaleTimeString());
+  chart.data.datasets.data.push(d.cf);
+  chart.data.datasets.data.push(d.pc);
+  chart.update();
+ };
+</script></body></html>
+)=====";
+
+ServidorAssincrono::ServidorAssincrono() : server(80), webSocket(81), clientes(0) {}
+
+void ServidorAssincrono::inicializar() {
+    server.on("/", [this]() { server.send_P(200, "text/html", INDEX_HTML); });
+    server.begin();
+    webSocket.begin();
+    webSocket.onEvent([this](uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+        this->gerenciarWS(num, type, payload, length);
+    });
 }
 
-void MotorIA::inicializar() {
-    contagem_welford = 0;
+void ServidorAssincrono::gerenciarWS(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+    if (type == WStype_CONNECTED) clientes++;
+    else if (type == WStype_DISCONNECTED) { if(clientes > 0) clientes--; }
 }
 
-void MotorIA::configurarHistorico(uint32_t ciclos, uint32_t anomalias) {
-    dados.total_ciclos = ciclos;
-    dados.total_anomalias = anomalias;
+void ServidorAssincrono::atualizar() {
+    server.handleClient();
+    webSocket.loop();
 }
 
-bool MotorIA::atualizarMetricas(const String& pacote) {
-    int idx1 = pacote.indexOf('|');
-    int idx2 = pacote.indexOf('|', idx1 + 1);
-    int idx3 = pacote.indexOf('|', idx2 + 1);
-    int idx4 = pacote.indexOf('|', idx3 + 1);
-
-    if (idx1 == -1 || idx2 == -1 || idx3 == -1 || idx4 == -1) return false;
-
-    String est = pacote.substring(0, idx1);
-    String prev = pacote.substring(idx1 + 1, idx2);
-    
-    memset(dados.estado_atual, 0, sizeof(dados.estado_atual));
-    memset(dados.previsao, 0, sizeof(dados.previsao));
-    strncpy(dados.estado_atual, est.c_str(), sizeof(dados.estado_atual) - 1);
-    strncpy(dados.previsao, prev.c_str(), sizeof(dados.previsao) - 1);
-
-    dados.confianca = pacote.substring(idx2 + 1, idx3).toFloat();
-    dados.precisao = pacote.substring(idx3 + 1, idx4).toFloat();
-    dados.rmse = pacote.substring(idx4 + 1).toFloat();
-
-    contagem_welford++;
-    if (contagem_welford == 1) {
-        welford_m = dados.confianca;
-    } else {
-        double antigo_m = welford_m;
-        welford_m += (dados.confianca - antigo_m) / contagem_welford;
-        welford_s += (dados.confianca - antigo_m) * (dados.confianca - welford_m);
-    }
-
-    if (contagem_welford > 10) {
-        double desvio = sqrt(welford_s / (contagem_welford - 1));
-        if (desvio > 0.5 && (welford_m - dados.confianca) > (3.0 * desvio)) {
-            dados.total_anomalias++;
-        }
-    }
-
-    dados.total_ciclos++;
-    return true;
-}
-
-void MotorIA::obterTelemetria(TelemetriaIA& dest) {
-    memcpy(&dest, &dados, sizeof(TelemetriaIA));
+void ServidorAssincrono::dispararStream(const TelemetriaIA& dados, uint32_t heap, uint32_t uptime) {
+    if (clientes == 0) return;
+    char json_buffer[256];
+    snprintf(json_buffer, sizeof(json_buffer),
+             "{\"at\":\"%s\",\"pr\":\"%s\",\"cf\":%.1f,\"pc\":%.1f,\"an\":%u,\"ram\":%u}",
+             dados.estado_atual, dados.previsao, dados.confianca, dados.precisao,
+             dados.total_anomalias, heap / 1024);
+    webSocket.broadcastTXT((uint8_t*)json_buffer, strlen(json_buffer));
 }
