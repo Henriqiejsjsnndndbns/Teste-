@@ -1,137 +1,27 @@
-import os
-os.environ["OPENCV_DISABLE_CPU_FEATURES"] = "AVX2,AVX,FMA,SSE4_1,SSE4_2"
+#pragma once
+#include <Arduino.h>
 
-import socket
-import time
-import json
-import cv2
-import numpy as np
-import mss
-import pytesseract
-import pyttsx3
+struct TelemetriaIA {
+    char estado_atual[32];
+    char previsao[32];
+    float confianca;
+    float precisao;
+    float rmse;
+    uint32_t total_ciclos;
+    uint32_t total_anomalias;
+};
 
-# Configurações do ecossistema e rede
-ESP32_IP = "192.168.4.1"
-UDP_PORT = 12345
+class MotorIA {
+private:
+    TelemetriaIA dados;
+    double welford_m;
+    double welford_s;
+    uint32_t contagem_welford;
 
-# Inicialização do sintetizador de voz offline
-engine = pyttsx3.init()
-engine.setProperty('rate', 165)
-
-# Cérebro Preditivo (Cadeia de Markov Incremental)
-historico_eventos = []
-transicoes = {} # Dicionário de frequências de transição de estados
-estado_atual = "IDLE"
-previsao_anterior = "IDLE"
-
-# Métricas de Validação Científica
-total_previsoes = 0
-previsoes_corretas = 0
-soma_erros_quad = 0.0
-
-def falar(texto):
-    """Executa a síntese de voz em segundo plano de forma descritiva."""
-    print(f"[Voz]: {texto}")
-    engine.say(texto)
-    engine.runAndWait()
-
-def prever_proximo_estado(estado):
-    """Calcula estatisticas de probabilidade do próximo evento."""
-    if estado not in transicoes or not transicoes[estado]:
-        return "IDLE", 50.0
-    
-    proximos = transicoes[estado]
-    total = sum(proximos.values())
-    melhor_proximo = max(proximos, key=proximos.get)
-    confianca = (proximos[melhor_proximo] / total) * 100.0
-    return melhor_proximo, confianca
-
-def treinar_modelo(estado_velho, estado_novo):
-    """Atualiza pesos da matriz de transição dinamicamente."""
-    if estado_velho not in transicoes:
-        transicoes[estado_velho] = {}
-    if estado_novo not in transicoes[estado_velho]:
-        transicoes[estado_velho][estado_novo] = 0
-    transicoes[estado_velho][estado_novo] += 1
-
-def processar_visao_computacional(img):
-    """Analisa o frame buscando padrões, textos (OCR) e contornos visuais."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # OCR Rápido limitado a strings curtas para economizar ciclos de CPU
-    texto = pytesseract.image_to_string(gray, config='--psm 7').strip()
-    
-    # Detecção de elementos estruturais (Botões, Menus, Ícones)
-    _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
-    contornos, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    botoes_detectados = 0
-    for c in contornos:
-        if cv2.contourArea(c) > 150: # Filtro de tamanho para contornos válidos
-            botoes_detectados += 1
-
-    # Classificação heurística de estado baseada no contexto visual
-    if "menu" in texto.lower() or "settings" in texto.lower():
-        return f"MENU_ABERTO_{botoes_detectados}"
-    elif botoes_detectados > 12:
-        return f"LISTA_COMPLEXA_{botoes_detectados}"
-    elif botoes_detectados > 2:
-        return f"INTERFACE_ATIVA_{botoes_detectados}"
-    return "TELA_ESTATICA"
-
-falar("Sistema preditivo de visão computacional ativo.")
-
-# Captura de alta eficiência via hardware utilizando a biblioteca MSS
-with mss.mss() as sct:
-    # Captura a tela principal inteira onde o scrcpy deve estar em foco
-    monitor = sct.monitors[1]
-    
-    while True:
-        try:
-            start_time = time.time()
-            sct_img = sct.grab(monitor)
-            frame = np.array(sct_img)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-
-            # Extração de Features por Visão Computacional
-            novo_estado = processar_visao_computacional(frame)
-
-            if novo_estado != estado_atual:
-                # Medição de Precisão da IA
-                global total_previsoes, previsoes_corretas, soma_erros_quad
-                if total_previsoes > 0:
-                    acertou = (previsao_anterior == novo_estado)
-                    if acertou:
-                        previsoes_corretas += 1
-                    erro_num = 0.0 if acertou else 1.0
-                    soma_erros_quad += erro_num ** 2
-
-                # Treinamento Online Incremental
-                treinar_modelo(estado_atual, novo_estado)
-                estado_atual = novo_estado
-                
-                # Executa nova previsão futura
-                previsao_futura, nivel_confianca = prever_proximo_estado(estado_atual)
-                previsao_anterior = previsao_futura
-                total_previsoes += 1
-
-                precisao_acc = (previsoes_corretas / total_previsoes) * 100.0
-                rmse = (soma_erros_quad / total_previsoes) ** 0.5
-
-                falar(f"Mudança detectada. Novo estado: {estado_atual}. Próxima ação prevista: {previsao_futura}.")
-
-                # Envio dos dados estruturados compactados via pacote UDP plano
-                payload = f"{estado_atual}|{previsao_futura}|{nivel_confianca:.1f}|{precisao_acc:.1f}|{rmse:.2f}"
-                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                    s.sendto(payload.encode("utf-8"), (ESP32_IP, UDP_PORT))
-                
-                print(f"[Notebook -> ESP32]: {payload}")
-
-            # Latência adaptativa controlada por hardware
-            elapsed = time.time() - start_time
-            sleep_time = max(0.05, 0.4 - elapsed)
-            time.sleep(sleep_time)
-
-        except Exception as e:
-            print(f"[Erro Script]: {e}")
-            time.sleep(1)
+public:
+    MotorIA();
+    void inicializar();
+    bool atualizarMetricas(const String& pacote);
+    void obterTelemetria(TelemetriaIA& dest);
+    void configurarHistorico(uint32_t ciclos, uint32_t anomalias);
+};
