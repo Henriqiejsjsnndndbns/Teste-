@@ -1,0 +1,132 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiUdp.h>
+
+// ========================================================
+// REQUISITO: COLOQUE OS DADOS DO WI-FI DA SUA CASA AQUI
+const char* ssid     = "NOME_DO_SEU_WIFI";
+const char* password = "SENHA_DO_SEU_WIFI";
+// ========================================================
+
+WebServer server(80);
+WiFiUDP udp;
+unsigned int localUdpPort = 12345;
+char packetBuffer[255];
+
+String valor_atual = "0";
+String proxima_previsao = "0";
+String erro_ia = "0";
+String peso_memoria = "0";
+
+// Interface Gráfica do Website integrada na memória do chip
+const char HTML_PAGINA[] PROGMEM = R"=====(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>Painel de Aprendizado IA</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #121214; color: #e1e1e6; margin: 0; padding: 20px; text-align: center; }
+        .container { max-width: 600px; margin: auto; background: #202024; padding: 30px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+        h1 { color: #04d361; font-size: 24px; margin-bottom: 20px; }
+        .card { background: #29292e; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 5px solid #04d361; text-align: left; }
+        .card.erro { border-left-color: #f75a68; }
+        .label { font-size: 14px; color: #a8a8b3; }
+        .valor { font-size: 22px; font-weight: bold; margin-top: 5px; color: #fff; }
+        .status { display: inline-block; padding: 5px 10px; background: #121214; border-radius: 20px; font-size: 12px; color: #04d361; margin-bottom: 20px; }
+    </style>
+    <script>
+        setInterval(function() {
+            fetch('/dados').then(response => response.json()).then(data => {
+                document.getElementById('atual').innerText = data.atual;
+                document.getElementById('previsao').innerText = data.previsao;
+                document.getElementById('erro').innerText = data.erro;
+                document.getElementById('peso').innerText = data.peso;
+            });
+        }, 300);
+    </script>
+</head>
+<body>
+    <div class='container'>
+        <h1>Cérebro IA - ESP32 Control</h1>
+        <div class='status'>● Conectado à Rede Local</div>
+        
+        <div class='card'>
+            <div class='label'>Estado Atual da Tela (Lido pelo Celular)</div>
+            <div class='valor' id='atual'>0.0</div>
+        </div>
+        <div class='card' style='border-left-color: #8257e5;'>
+            <div class='label'>🔮 Próximo Passo Previsto (O Futuro)</div>
+            <div class='valor' id='previsao'>0.0</div>
+        </div>
+        <div class='card erro'>
+            <div class='label'>⚠️ Desvio de Erro Atual (Auto-Correção)</div>
+            <div class='valor' id='erro'>0.0</div>
+        </div>
+        <div class='card' style='border-left-color: #ffcd1e;'>
+            <div class='label'>🧠 Peso de Memória Atualizado (Evolução)</div>
+            <div class='valor' id='peso'>0.0</div>
+        </div>
+    </div>
+</body>
+</html>
+)=====";
+
+void handleRoot() {
+    server.send(200, "text/html", HTML_PAGINA);
+}
+
+void handleDados() {
+    String json = "{\"atual\":\"" + valor_atual + "\",\"previsao\":\"" + proxima_previsao + "\",\"erro\":\"" + erro_ia + "\",\"peso\":\"" + peso_memoria + "\"}";
+    server.send(200, "application/json", json);
+}
+
+void setup() {
+    Serial.begin(115200);
+    
+    // Conectando ao Wi-Fi de sua casa
+    Serial.print("Conectando ao Wi-Fi residencial: ");
+    Serial.println(ssid);
+    WiFi.begin(ssid, password);
+
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    
+    Serial.println("\nWi-Fi Conectado com Sucesso!");
+    Serial.print("Abra este IP no navegador do seu Kali Linux: http://");
+    Serial.println(WiFi.localIP());
+
+    server.on("/", handleRoot);
+    server.on("/dados", handleDados);
+    server.begin();
+
+    udp.begin(localUdpPort);
+}
+
+void loop() {
+    server.handleClient();
+
+    int packetSize = udp.parsePacket();
+    if (packetSize) {
+        int len = udp.read(packetBuffer, 255);
+        if (len > 0) {
+            packetBuffer[len] = 0;
+        }
+        String dadosRecebidos = String(packetBuffer);
+        
+        int idx1 = dadosRecebidos.indexOf('|');
+        int idx2 = dadosRecebidos.indexOf('|', idx1 + 1);
+        int idx3 = dadosRecebidos.indexOf('|', idx2 + 1);
+
+        if(idx1 != -1 && idx2 != -1 && idx3 != -1) {
+            valor_atual = dadosRecebidos.substring(0, idx1);
+            proxima_previsao = dadosRecebidos.substring(idx1 + 1, idx2);
+            erro_ia = dadosRecebidos.substring(idx2 + 1, idx3);
+            peso_memoria = dadosRecebidos.substring(idx3 + 1);
+        }
+    }
+}
