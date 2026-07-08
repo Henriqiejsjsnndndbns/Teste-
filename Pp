@@ -1,0 +1,4 @@
+esptool.py --chip esp32s3 --port /dev/ttyACM0 write_flash -z \
+0x0000 BlueJammer-V2.ino.bootloader.bin \
+0x8000 BlueJammer-V2.ino.partitions.bin \
+0x10000 BlueJammer-V2.ino.bin
